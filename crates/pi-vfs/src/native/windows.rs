@@ -321,10 +321,17 @@ fn null_device_metadata(path: &Path) -> io::Result<Metadata> {
 	if !is_null_device(path) {
 		return Err(io::Error::from(io::ErrorKind::NotFound));
 	}
+	// The device has no timestamps of its own; report the lookup time, as a
+	// Unix `/dev/null` (touched by every write) shows a current date, rather
+	// than none, which `ls -l` renders as `???`.
+	let now = SystemTime::now();
 	Ok(Metadata::new(FileType::from_kind(FileKind::CharDevice), 0, Permissions::from_mode(0o666))
 		.with_blocks(0, 4096)
 		.with_nlink(1)
-		.with_rdev(0))
+		.with_rdev(0)
+		.with_modified(now)
+		.with_accessed(now)
+		.with_changed(now))
 }
 
 pub(crate) fn file_is_locked(_file: &fs::File) -> io::Result<bool> {

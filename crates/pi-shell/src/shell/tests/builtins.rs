@@ -1768,3 +1768,22 @@ async fn builtins_read_the_null_device_from_dev_null() {
 		.expect("status readout");
 	assert_eq!(read_capture(&status), "cat=0\nhead=0\nls=0\n");
 }
+
+/// `ls -l /dev/null` on Windows lists a character device with a real
+/// date. A regression drops the null device's synthetic timestamps and the
+/// long listing renders the date column as `???`.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn ls_long_lists_the_null_device_with_a_date() {
+	let mut session = default_session().await;
+	let out = tempfile::tempfile().expect("stdout capture");
+	let result = session
+		.run_test("ls -l /dev/null", &TestStdio::null().stdout(&out))
+		.await
+		.expect("ls -l /dev/null");
+	assert_eq!(exit_code(&result), 0);
+	let line = read_capture(&out);
+	assert!(line.starts_with('c'), "character device: {line}");
+	assert!(line.trim_end().ends_with("/dev/null"), "operand as spelled: {line}");
+	assert!(!line.contains("???"), "date column present: {line}");
+}
