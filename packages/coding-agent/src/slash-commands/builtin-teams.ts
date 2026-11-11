@@ -27,12 +27,12 @@ import type { SlashCommandRuntime, SlashCommandSpec } from "./types";
 
 const USAGE = [
 	"Usage:",
-	"  /team start <name> [assignment]  spawn every member of team <name>",
-	"  /team list                       show discovered team files",
-	"  /team status [name]              member handles + live registry status",
+	"  /team start <name> [assignment]    spawn every member of team <name>",
+	"  /team list                         show discovered team files",
+	"  /team status [name]                member handles + live registry status",
 	"  /team stop [--force] <name|handle|all>  request stop (or force release)",
-	"  /team approve <handle>           approve a submitted member plan",
-	"  /team reject <handle> <reason>   reject a plan and require resubmission",
+	"  /team approve <handle> [--rev N]   approve a submitted member plan",
+	"  /team reject <handle> [--rev N] <reason>  reject a plan and require resubmission",
 ].join("\n");
 
 function teamRuntimeError(message: string): string {
@@ -110,8 +110,8 @@ export const BUILTIN_TEAMS_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				description: "Request members to stop, or force release",
 				usage: "[--force] <name|handle|all>",
 			},
-			{ name: "approve", description: "Approve a submitted member plan", usage: "<handle>" },
-			{ name: "reject", description: "Reject a plan and request revision", usage: "<handle> <reason>" },
+			{ name: "approve", description: "Approve a submitted member plan", usage: "<handle> [--rev N]" },
+			{ name: "reject", description: "Reject a plan and request revision", usage: "<handle> [--rev N] <reason>" },
 		],
 		subcommandOptional: true,
 		getTuiAutocompleteDescription: () => "Agent teams",
@@ -143,13 +143,26 @@ export const BUILTIN_TEAMS_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				return commandConsumed();
 			}
 			if (verb === "approve" || verb === "reject") {
-				const [handle, ...words] = rest.trim().split(/\s+/).filter(Boolean);
-				if (!handle || (verb === "approve" ? words.length !== 0 : words.length === 0)) return usage(USAGE, runtime);
+				const words = rest.trim().split(/\s+/).filter(Boolean);
+				const handle = words.shift();
+				// A `--rev` token in handle position is a usage error, not a handle:
+				// `/team approve --rev 1` must reach usage, not an unknown-member error.
+				if (handle === "--rev") return usage(USAGE, runtime);
+				let revision: number | undefined;
+				if (words[0] === "--rev") {
+					words.shift();
+					const value = words.shift();
+					if (!value || !/^[1-9][0-9]*$/.test(value)) return usage(USAGE, runtime);
+					revision = Number(value);
+				}
+				const reason = words.join(" ");
+				if (!handle || (verb === "approve" ? reason !== "" : reason === "")) return usage(USAGE, runtime);
+				if (words.includes("--rev")) return usage(USAGE, runtime);
 				try {
 					const client = getTeamClient();
 					const key = runtime.session.instanceKey;
-					if (verb === "approve") await client.approve(key, handle);
-					else await client.reject(key, handle, words.join(" "));
+					if (verb === "approve") await client.approve(key, handle, revision);
+					else await client.reject(key, handle, reason, revision);
 					await runtime.output(`${handle}: plan ${verb === "approve" ? "approved" : "rejected"}`);
 				} catch (error) {
 					await runtime.output(teamRuntimeError(error instanceof Error ? error.message : String(error)));
@@ -343,10 +356,28 @@ export const BUILTIN_TEAMS_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 							lines.push(`${handle} → pending (${error.agentId}); the run is still starting`);
 							continue;
 						}
-						await updateMember(key, team.name, started.generation, handle, entry, () => undefined);
+						const message = error instanceof Error ? error.message : String(error);
+						// The spawn ended without registering a ref: resolve any pending stop
+						// through the same failure branch as a pending registration, so the
+						// member is marked failed, the intent clears, and the lead is notified
+						// instead of the stop waiting out the ack timeout.
+						const resolved = await client.resolvePendingStop(
+							key,
+							team.name,
+							started.generation,
+							handle,
+							entry,
+							undefined,
+							message,
+						);
+						if (!resolved) {
+							// The member registered after all, was replaced, or the generation
+							// ended: drop the stale membership rather than marking it failed.
+							await updateMember(key, team.name, started.generation, handle, entry, () => undefined);
+						}
 						releaseStructuredSubagentId(toolSession, entry.id);
 						failures += 1;
-						lines.push(`${handle} → FAILED: ${error instanceof Error ? error.message : String(error)}`);
+						lines.push(`${handle} → FAILED: ${message}`);
 					}
 				}
 				if (skipped > 0) {

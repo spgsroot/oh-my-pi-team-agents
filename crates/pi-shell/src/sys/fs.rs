@@ -426,13 +426,14 @@ impl File for StdFile {
 /// Engine path → host path (UTF-8 required on Windows). A URL path
 /// ([`crate::bash::fs::url_root_len`]) names no host file: `NotFound`, rather
 /// than a lookup relative to the process's working directory. On Windows the
-/// exact path `/dev/null` is the null device `NUL`; a longer name is not.
+/// null device [`pi_vfs::windows_null_device`] decides the exact spelling
+/// `/dev/null` maps to `NUL`; a longer name does not.
 pub fn host_path(p: &[u8]) -> io::Result<&Path> {
 	if crate::bash::fs::url_root_len(p).is_some() {
 		return Err(io::Error::from(io::ErrorKind::NotFound));
 	}
 	#[cfg(windows)]
-	if p == b"/dev/null" {
+	if pi_vfs::windows_null_device(p) {
 		return Ok(Path::new("NUL"));
 	}
 	p.to_path()
@@ -1332,6 +1333,34 @@ mod tests {
 		}
 		let url = host_path(b"skill://x/y").unwrap_err();
 		assert_eq!(url.kind(), io::ErrorKind::NotFound);
+	}
+
+	/// The null device answers `access` through both the engine spelling
+	/// `/dev/null` and a host-style `NUL`: readable and writable even though
+	/// `GetFileAttributes` cannot stat the device, and never executable. A
+	/// regression breaks `test -r` / `test -w`, or lets `test -x` succeed.
+	#[cfg(windows)]
+	#[test]
+	fn access_nul_accepts_read_write_and_denies_exec() {
+		for path in [b"/dev/null".as_bstr(), b"NUL".as_bstr()] {
+			assert!(access(path, Access::READ).is_ok(), "{path} readable");
+			assert!(access(path, Access::WRITE).is_ok(), "{path} writable");
+			assert_eq!(
+				access(path, Access::EXEC).map_err(|e| e.kind()),
+				Err(io::ErrorKind::PermissionDenied),
+				"{path} executable"
+			);
+		}
+	}
+
+	/// The Unix counterpart of the Windows null-device test above:
+	/// `/dev/null` is readable and writable through the native path. A
+	/// regression makes `test -r` / `test -w` fail on the device.
+	#[cfg(unix)]
+	#[test]
+	fn access_reports_dev_null_readable_and_writable() {
+		assert!(access(b"/dev/null".as_bstr(), Access::READ).is_ok());
+		assert!(access(b"/dev/null".as_bstr(), Access::WRITE).is_ok());
 	}
 
 	#[cfg(unix)]

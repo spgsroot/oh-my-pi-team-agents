@@ -256,6 +256,7 @@ function serveRegistry(bridge: MainSessionBridge): RpcServe<AgentRegistry, Agent
 		setHistory: (registry, id, history, expectedSessionFile) => registry.setHistory(id, history, expectedSessionFile),
 		setStatus: (registry, id, status, expected) => registry.setStatus(id, status, expected),
 		markResultAccepted: (registry, id, expected, responseAt) => registry.markResultAccepted(id, expected, responseAt),
+		markTurnSettled: (registry, id, expected, summary) => registry.markTurnSettled(id, expected, summary),
 		staleAcceptedRuns: registry => registry.staleAcceptedRuns(),
 		setActivity: (registry, id, activity) => registry.setActivity(id, activity),
 		attachSession: (registry, id, session, sessionFile, expected) =>
@@ -281,6 +282,7 @@ function serveLifecycle(bridge: MainSessionBridge): RpcServe<AgentLifecycleManag
 		reclaimDeadCorpse: (lifecycle, id, expected) => lifecycle.reclaimDeadCorpse(id, expected),
 		manages: (lifecycle, registry) => lifecycle.manages(registry),
 		isParking: (lifecycle, id, expected) => lifecycle.isParking(id, expected),
+		canRevive: (lifecycle, ref) => lifecycle.canRevive(ref),
 		park: (lifecycle, id) => lifecycle.park(id),
 		ensureLive: (lifecycle, id) => lifecycle.ensureLive(id),
 		release: (lifecycle, id, expected, options) => lifecycle.release(id, expected, options),
@@ -301,7 +303,7 @@ function serveBus(bridge: MainSessionBridge): RpcServe<IrcBus, IrcBusProtocol> {
 				signal ? AbortSignal.any([signal, bridge.exited.signal]) : bridge.exited.signal,
 				options,
 			),
-		take: (bus, agentId, from) => bus.take(agentId, from),
+		take: (bus, agentId, from, filter) => bus.take(agentId, from, filter),
 		unreadCount: (bus, agentId) => bus.unreadCount(agentId),
 		recordReply: (bus, from, to) => bus.recordReply(from, to),
 	};

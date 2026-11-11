@@ -111,6 +111,7 @@ import { normalizeSchema } from "../tools/jtd-to-json-schema";
 import { buildOutputValidator, summarizeValidationFailure } from "../tools/output-schema-validator";
 import { ToolAbortError } from "../tools/tool-errors";
 import { resetYieldTurnState } from "../tools/yield";
+import { truncateCodePoints } from "../utils/code-points";
 import { type EventBus, emitSubagentFrame } from "../utils/event-bus";
 import { trackLateCleanup } from "../utils/late-cleanup";
 import { isMainThread } from "../thread/identity";
@@ -3336,9 +3337,12 @@ async function relayA2aWakeTurnOutput(args: {
 	finalizeError: unknown;
 }): Promise<void> {
 	if (wakeTurnFailed(args)) return;
+	// The published answer is capped at the same code-point boundary as the
+	// artifact inline (A2A_ARTIFACT_MAX_CHARS Unicode code points); the plain
+	// final-text fallback below stays uncapped.
 	const answer =
 		args.yielded && args.result?.outputPath
-			? (await Bun.file(args.result.outputPath).text()).slice(0, A2A_ARTIFACT_MAX_CHARS)
+			? truncateCodePoints(await Bun.file(args.result.outputPath).text(), A2A_ARTIFACT_MAX_CHARS)
 			: args.turnText.trim();
 	if (!answer) return;
 	const ids = new Set<string>();
@@ -3354,12 +3358,12 @@ async function relayA2aWakeTurnOutput(args: {
 		)
 			continue;
 		ids.add(messageId);
-		const request = await IncomingRequests.global().consume({ to: args.id, messageId });
-		if (!request) continue;
+		const lease = await IncomingRequests.global().consume({ to: args.id, messageId });
+		if (!lease) continue;
 		const { session } = args;
 		void sendA2aReply({
 			bridge: session.a2aBridge,
-			request,
+			lease,
 			answer,
 			identity: async () => {
 				try {
@@ -3799,6 +3803,11 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 					relay.resolve();
 				}
 			}
+			// Turn finally idle (#T-4): the wake turn reached its terminal
+			// decision; publish the settle the team runtime's idle notice keys
+			// on. `turnText` is the turn's own summary; a ref whose mirror
+			// never delivered idle is reconciled inside markTurnSettled.
+			AgentRegistry.global().markTurnSettled(id, session, turnText.trim() || undefined);
 		};
 	});
 }
@@ -4184,6 +4193,9 @@ async function driveFollowUpTurn(
 			const active = monitor.takeActiveSession();
 			if (active) monitor.captureSalvage(active);
 			monitor.finish();
+			// Turn finally idle (#T-4): the follow-up turn reached its terminal
+			// decision; publish the settle the team runtime's idle notice keys on.
+			AgentRegistry.global().markTurnSettled(id, session, monitor.lastReportTurnText()?.trim() || undefined);
 		}
 
 		return await finalizeRunResult({
@@ -5475,6 +5487,19 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 			error = outcome.error;
 			aborted = outcome.aborted;
 			abortReasonText = outcome.abortReasonText;
+			// Turn finally idle (#T-4): the run reached its terminal decision —
+			// an accepted yield/handback or reminders exhausted. Publish the
+			// settle the team runtime's idle notice keys on; the monitor's
+			// report-turn text is the final turn's own summary. An aborted run
+			// has no terminal decision to settle: its mirror may not have
+			// delivered `aborted` yet, and a notice must not fire for it.
+			if (!aborted) {
+				AgentRegistry.global().markTurnSettled(
+					id,
+					session,
+					monitor.lastReportTurnText()?.trim() || monitor.rawOutput().trim() || undefined,
+				);
+			}
 		} catch (err) {
 			exitCode = 1;
 			if (!abortSignal.aborted) {

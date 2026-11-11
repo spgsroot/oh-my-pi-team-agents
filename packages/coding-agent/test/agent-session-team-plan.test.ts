@@ -253,9 +253,9 @@ function rewritingRunner(rewrite: () => unknown): ExtensionRunner {
 }
 
 describe("AgentSession authoritative team plan gate", () => {
-	it("allows only the six exact read/wait names, not aliases or unlisted tools", async () => {
+	it("allows only the eight exact read/search/wait names, not aliases or unlisted tools", async () => {
 		const { session } = await fixture();
-		for (const name of ["read", "grep", "glob", "lsp", "web_search", "wait"])
+		for (const name of ["read", "grep", "glob", "find", "ast_grep", "lsp", "web_search", "wait"])
 			expect((await before(session, name, name === "lsp" ? { action: "hover" } : {}))?.block).not.toBe(true);
 		for (const name of [
 			"bash",
@@ -271,6 +271,17 @@ describe("AgentSession authoritative team plan gate", () => {
 		]) {
 			expect(await before(session, name)).toMatchObject({ block: true, reason: required });
 		}
+	});
+	it("admits read-only find and ast_grep, keeping ast_edit, edit, bash and file writes blocked", async () => {
+		const { session } = await fixture();
+		for (const name of ["find", "ast_grep"]) expect((await before(session, name))?.block).not.toBe(true);
+		for (const name of ["ast_edit", "edit", "bash"])
+			expect(await before(session, name)).toMatchObject({ block: true, reason: required });
+		expect(await dispatchWrite(session, { path: "blocked.txt", content: "bad" })).toMatchObject({
+			block: true,
+			reason: required,
+		});
+		expect(await Bun.file(path.join(cwd, "blocked.txt")).exists()).toBe(false);
 	});
 
 	it("blocks mutating LSP actions and extension rewrites to them", async () => {
@@ -587,5 +598,14 @@ describe("AgentSession authoritative team plan gate", () => {
 			block: true,
 			reason: required,
 		});
+	});
+	it("blocks a plain same-text error from a stub: only coded runtime errors open the cold-revival fallback", async () => {
+		// Same message text as the runtime's TEAM_LEAD_GONE error, but thrown by
+		// a plain Error with no `code`: the fallback must match the coded class,
+		// never the text, so a spoofed stub cannot unlock the gate.
+		const { session, client, toolSession } = await fixture();
+		toolSession.teamIdentity = { ...toolSession.teamIdentity!, planApproval: false };
+		vi.spyOn(client, "planPending").mockRejectedValue(new Error("Team lead is no longer registered"));
+		expect(await before(session, "read")).toMatchObject({ block: true, reason: required });
 	});
 });

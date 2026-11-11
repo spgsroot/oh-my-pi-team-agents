@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
@@ -13,7 +13,7 @@ import type { EffectiveExtensionRoots } from "@oh-my-pi/pi-coding-agent/capabili
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { parseModelPattern } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { A2aAgentBridge } from "@oh-my-pi/pi-coding-agent/a2a/agent-bridge";
+import { A2aAgentBridge, spawnA2aAgent } from "@oh-my-pi/pi-coding-agent/a2a/agent-bridge";
 import { IncomingRequests } from "@oh-my-pi/pi-coding-agent/a2a/incoming-requests";
 import { A2A_ARTIFACT_MAX_CHARS } from "@oh-my-pi/pi-coding-agent/a2a/rpc";
 import { cfgCompaction } from "@oh-my-pi/pi-coding-agent/session/context-settings";
@@ -50,12 +50,13 @@ import type { TeamIdentity } from "@oh-my-pi/pi-coding-agent/task/team-runtime";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { buildWakeRelayBody } from "@oh-my-pi/pi-coding-agent/task/executor";
+import { settleA2aReplies } from "@oh-my-pi/pi-coding-agent/a2a/reply-relay";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { type IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { getConfigRootDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { localSession } from "../helpers/local-session";
 import { createSessionDefaults } from "../helpers/session-defaults";
 
@@ -1767,6 +1768,21 @@ describe("persisted subagent revival", () => {
 	});
 
 	describe("wake-turn relay", () => {
+		// The relay's rescan reads the live-bridge registry under the session's
+		// agentDir. Point it at an empty temp dir so the machine's real bridges
+		// (other omp sessions) can never leak discovery fetches into these
+		// tests — the unmatched-URL test asserts zero network calls.
+		let agentDirBackup: string | undefined;
+		beforeAll(() => {
+			agentDirBackup = process.env.PI_CODING_AGENT_DIR;
+			const dir = makeTempDir("@pi-revive-a2a-agentdir-");
+			setAgentDir(dir);
+		});
+		afterAll(() => {
+			// Restore the default resolver state the process started with.
+			setAgentDir(path.join(getConfigRootDir(), "agent"));
+			if (agentDirBackup === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		});
 		async function reviveWithWaker(cwd: string): Promise<{ ref: AgentRef; handle: RevivedSessionHandle }> {
 			AgentRegistry.resetGlobalForTests();
 			AgentLifecycleManager.resetGlobalForTests();
@@ -1821,6 +1837,8 @@ describe("persisted subagent revival", () => {
 			const { promise: blocked, resolve: unblock } = Promise.withResolvers<void>();
 			const { promise: called, resolve: notifyCall } = Promise.withResolvers<void>();
 			const { promise: calledTwice, resolve: notifySecondCall } = Promise.withResolvers<void>();
+			/** Switched on by a test: every RPC answers with a JSON-RPC error, so the send fails. */
+			let failRpc = false;
 			const server = Bun.serve({
 				hostname: "127.0.0.1",
 				port: 0,
@@ -1833,6 +1851,8 @@ describe("persisted subagent revival", () => {
 					calls.push(body);
 					notifyCall();
 					if (calls.length === 2) notifySecondCall();
+					if (failRpc)
+						return Response.json({ jsonrpc: "2.0", id: body.id, error: { code: -32000, message: "boom" } });
 					if (blockSend) await blocked;
 					return Response.json({
 						jsonrpc: "2.0",
@@ -1855,8 +1875,14 @@ describe("persisted subagent revival", () => {
 				url: `http://127.0.0.1:${server.port}/`,
 			});
 			const busSend = vi.spyOn(IrcBus.global(), "send");
-			const note = (messageId: string) =>
-				IncomingRequests.global().note({ to: ref.id, from: "peer", messageId, at: Date.now() });
+			const note = (messageId: string, fromUrl?: string) =>
+				IncomingRequests.global().note({
+					to: ref.id,
+					from: "peer",
+					messageId,
+					at: Date.now(),
+					...(fromUrl !== undefined ? { fromUrl } : {}),
+				});
 			const finish = async (
 				records: CustomMessage[],
 				stop: LastAssistantStop = { stopReason: "stop", content: [{ type: "text", text: "answer" }] },
@@ -1869,7 +1895,19 @@ describe("persisted subagent revival", () => {
 				handle.setLastAssistantStop(stop);
 				await complete?.();
 			};
-			return { ref, handle, calls, server, busSend, note, finish, called, calledTwice, unblock };
+			return {
+				ref,
+				handle,
+				calls,
+				server,
+				busSend,
+				note,
+				finish,
+				called,
+				calledTwice,
+				unblock,
+				fail: () => (failRpc = true),
+			};
 		}
 
 		it("sends an external wake answer to the peer without relaying to the pseudo-sender", async () => {
@@ -1885,6 +1923,7 @@ describe("persisted subagent revival", () => {
 				});
 				expect(h.busSend.mock.calls.some(([message]) => message.to === "a2a")).toBe(false);
 				expect(await IncomingRequests.global().list(h.ref.id)).toEqual([]);
+				await settleA2aReplies();
 			} finally {
 				h.server.stop(true);
 			}
@@ -1920,6 +1959,67 @@ describe("persisted subagent revival", () => {
 						message: { parts: [{ text: published.slice(0, A2A_ARTIFACT_MAX_CHARS) }] },
 					},
 				});
+				await settleA2aReplies();
+			} finally {
+				h.server.stop(true);
+			}
+		});
+
+		it("wake relay published output uses the same code-point cap", async () => {
+			const h = await externalHarness();
+			try {
+				await h.note("req-1");
+				// The wake harness publishes the yielded report inside a JSON
+				// envelope (`{\n  "report": "…"`), so the filler is sized to put
+				// the astral code point exactly at the 100_000th code point of
+				// the *published* text: a UTF-16-unit slice at the cap would cut
+				// the emoji in half and emit an unpaired high surrogate, the
+				// code-point cap keeps the whole 😀 and drops the trailing "z".
+				const envelopePrefixLength = [...JSON.stringify({ report: "" }, null, 2)].length - 3;
+				const fillerLength = A2A_ARTIFACT_MAX_CHARS - envelopePrefixLength - 1;
+				const report = "a".repeat(fillerLength) + "😀" + "z";
+				const expectedPrefix = "a".repeat(fillerLength) + "😀";
+				const localReply = IrcBus.global().wait("Main", { from: h.ref.id }, 5000);
+				await h.finish([externalRecord("req-1"), wakeRecord("Main")], { stopReason: "aborted" }, async () => {
+					h.handle.emit({
+						type: "tool_execution_end",
+						toolCallId: "yield-1",
+						toolName: "yield",
+						result: {
+							content: [{ type: "text", text: "Result submitted." }],
+							details: { status: "success", data: { report } },
+						},
+						isError: false,
+					} as AgentSessionEvent);
+				});
+				const local = await localReply;
+				expect(local?.body).toContain("agent://");
+				await h.called;
+				expect(h.calls).toHaveLength(1);
+				const published = await Bun.file(path.join(path.dirname(h.ref.sessionFile!), `${h.ref.id}.md`)).text();
+				// The published artifact keeps the whole report (the JSON envelope
+				// the schema-less wake harness writes around the yielded data).
+				expect(published).toContain(report);
+				const emitted = h.calls[0]?.params.message.parts[0]?.text;
+				// The emitted answer is the code-point prefix of the published
+				// JSON envelope: it must end in the complete 😀 (not its high
+				// surrogate half) and drop everything after the cap.
+				expect(emitted).toBe(`{\n  "report": "${expectedPrefix}`);
+				expect([...(emitted ?? "")]).toHaveLength(A2A_ARTIFACT_MAX_CHARS);
+				expect(emitted).not.toContain("z");
+				// No new unpaired surrogate at the cut (the whole emoji survived).
+				expect(emitted?.endsWith("😀")).toBe(true);
+				for (let index = 0; index < (emitted?.length ?? 0); index++) {
+					const unit = emitted.charCodeAt(index);
+					if (unit >= 0xd800 && unit <= 0xdbff) {
+						const next = emitted.charCodeAt(index + 1);
+						expect(next >= 0xdc00 && next <= 0xdfff).toBe(true);
+						index += 1;
+					} else {
+						expect(unit < 0xdc00 || unit > 0xdfff).toBe(true);
+					}
+				}
+				await settleA2aReplies();
 			} finally {
 				h.server.stop(true);
 			}
@@ -1937,7 +2037,11 @@ describe("persisted subagent revival", () => {
 					await Promise.race([h.handle.trackedReplies[0].then(() => true), Bun.sleep(250).then(() => false)]),
 				).toBe(true);
 			} finally {
+				// The turn settled without waiting for the blocked transport; release
+				// the send, then drain it so the fixture teardown resets globals with
+				// no send still in flight.
 				h.unblock();
+				await settleA2aReplies();
 				h.server.stop(true);
 			}
 		});
@@ -1952,20 +2056,125 @@ describe("persisted subagent revival", () => {
 				expect(h.calls.map(call => call.params.metadata.inReplyTo).sort()).toEqual(["req-1", "req-2"]);
 				expect(h.calls.map(call => call.params.message.parts[0]?.text)).toEqual(["answer", "answer"]);
 				expect(await IncomingRequests.global().list(h.ref.id)).toEqual([]);
+				await settleA2aReplies();
 			} finally {
 				h.server.stop(true);
 			}
 		});
 
-		it("does not automatically answer a request explicitly consumed during the wake", async () => {
+		it("does not automatically answer a request explicitly claimed during the wake", async () => {
 			const h = await externalHarness();
 			try {
 				await h.note("req-1");
 				await h.finish([externalRecord("req-1")], undefined, async () => {
-					await IncomingRequests.global().consume({ to: h.ref.id, from: "peer", messageId: "req-1" });
+					// An explicit task-tool claim leases the request while the
+					// turn is live; the automatic relay must not take it back.
+					const lease = await IncomingRequests.global().consume({
+						to: h.ref.id,
+						from: "peer",
+						messageId: "req-1",
+					});
+					expect(lease?.request.messageId).toBe("req-1");
 				});
+				await settleA2aReplies();
 				expect(h.calls).toEqual([]);
 				expect(h.busSend.mock.calls.some(([message]) => message.to === "a2a")).toBe(false);
+			} finally {
+				h.server.stop(true);
+			}
+		});
+
+		it("keeps a failed automatic answer open for a manual reply", async () => {
+			const h = await externalHarness();
+			try {
+				await h.note("req-1");
+				// The peer accepts the connection but answers with a JSON-RPC
+				// error, so the send fails and the lease must be released.
+				h.fail();
+				await h.finish([externalRecord("req-1")]);
+				await h.called;
+				await settleA2aReplies();
+				expect((await IncomingRequests.global().list(h.ref.id)).map(request => request.messageId)).toEqual([
+					"req-1",
+				]);
+			} finally {
+				h.server.stop(true);
+			}
+		});
+
+		it("refuses an ambiguous sender through the subagent relay and keeps it manually answerable", async () => {
+			const h = await externalHarness();
+			try {
+				// A second registration advertises the same skill id from a
+				// different endpoint, and the request carries no fromUrl to
+				// disambiguate: the executor relay must refuse to pick one.
+				h.handle.session.a2aBridge.add({
+					name: "a2a:peer",
+					skillId: "peer",
+					description: "peer twin",
+					cardName: "peer",
+					url: "http://127.0.0.1:1/",
+				});
+				await h.note("req-amb");
+				await h.finish([externalRecord("req-amb")]);
+				await settleA2aReplies();
+				expect(h.calls).toEqual([]);
+				expect((await IncomingRequests.global().list(h.ref.id)).map(request => request.messageId)).toEqual([
+					"req-amb",
+				]);
+				// The manual escape hatch still works: a deliberately selected
+				// runtime agent (the reachable server registration, whose base
+				// name the twin's suffixing left untouched) closes it once.
+				const lease = await IncomingRequests.global().consume({
+					to: h.ref.id,
+					from: "peer",
+					messageId: "req-amb",
+				});
+				expect(lease?.request.messageId).toBe("req-amb");
+				const manualTarget = h.handle.session.a2aBridge.get("a2a:peer")!;
+				expect(manualTarget.url).toBe(`http://127.0.0.1:${h.server.port}/`);
+				const outcome = await spawnA2aAgent({
+					agent: manualTarget,
+					prompt: "manual twin answer",
+					inReplyTo: "req-amb",
+				});
+				expect(outcome.exitCode).toBe(0);
+				expect(h.calls).toHaveLength(1);
+				expect(h.calls[0]).toMatchObject({
+					params: { metadata: { inReplyTo: "req-amb" }, message: { parts: [{ text: "manual twin answer" }] } },
+				});
+				await IncomingRequests.global().confirm(lease!.leaseId);
+				expect(await IncomingRequests.global().list(h.ref.id)).toEqual([]);
+				await settleA2aReplies();
+			} finally {
+				h.server.stop(true);
+			}
+		});
+
+		it("never contacts an unmatched sender URL through the default transport", async () => {
+			const h = await externalHarness();
+			try {
+				// The executor relay uses the real spawnA2aAgent (no send seam):
+				// a request whose fromUrl matches no registered endpoint must
+				// produce no network call at all — the URL is bookkeeping, never
+				// a destination.
+				const fetches: string[] = [];
+				const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation((async (input: unknown) => {
+					fetches.push(String(input));
+					throw new Error("network must not be used");
+				}) as unknown as typeof fetch);
+				try {
+					await h.note("req-unmatched", "http://127.0.0.1:7603/");
+					await h.finish([externalRecord("req-unmatched")]);
+					await settleA2aReplies();
+					expect(h.calls).toEqual([]);
+					expect(fetches).toEqual([]);
+					expect((await IncomingRequests.global().list(h.ref.id)).map(request => request.messageId)).toEqual([
+						"req-unmatched",
+					]);
+				} finally {
+					fetchSpy.mockRestore();
+				}
 			} finally {
 				h.server.stop(true);
 			}
@@ -1984,6 +2193,7 @@ describe("persisted subagent revival", () => {
 				try {
 					await h.note("req-1");
 					await h.finish([externalRecord("req-1")], stop);
+					await settleA2aReplies();
 					expect(h.calls).toEqual([]);
 					expect((await IncomingRequests.global().list(h.ref.id)).map(request => request.messageId)).toEqual([
 						"req-1",
@@ -2005,6 +2215,7 @@ describe("persisted subagent revival", () => {
 					{ ...wakeRecord("a2a"), details: { from: "a2a", external: true } },
 					{ ...wakeRecord("Main"), details: { from: "Main", a2aMessageId: "req-2" } },
 				]);
+				await settleA2aReplies();
 				expect(h.calls).toEqual([]);
 				expect(h.busSend.mock.calls.some(([message]) => message.to === "a2a")).toBe(false);
 				expect(await IncomingRequests.global().list(h.ref.id)).toHaveLength(2);
@@ -2037,6 +2248,44 @@ describe("persisted subagent revival", () => {
 			AgentLifecycleManager.resetGlobalForTests();
 			AgentRegistry.resetGlobalForTests();
 			IrcBus.resetGlobalForTests();
+		});
+
+		it("settles the turn exactly once on the registry when a wake turn finishes", async () => {
+			// The wake-turn observer's finish publishes the turn's settle: one
+			// `final: true` status_changed carrying the turn's answer text as the
+			// summary. The harness's run-state mirror never delivers idle, so the
+			// settle's reconciliation must terminalize the ref itself.
+			const cwd = makeTempDir("@pi-revive-settle-");
+			const { ref, handle } = await reviveWithWaker(cwd);
+			const observer = handle.observer();
+			expect(observer).toBeDefined();
+			// The spy bypasses real registration: bind the revived session and
+			// mark the turn running, as the live createAgentSession + revive flow
+			// would, so the settle's ref-ownership check passes.
+			const registry = AgentRegistry.global();
+			expect(registry.attachSession(ref.id, handle.session as never, ref.sessionFile, registry.get(ref.id))).toBe(
+				true,
+			);
+			registry.setStatus(ref.id, "running", registry.get(ref.id));
+			const finals: Array<{ id: string; summary?: string }> = [];
+			const unsubscribe = registry.onChange(event => {
+				if (event.type === "status_changed" && event.final === true)
+					finals.push({ id: event.ref.id, summary: event.summary });
+			});
+			try {
+				const finish = observer?.([wakeRecord("Main")]);
+				handle.setLastAssistantText("Turn answer");
+				await finish?.();
+				await handle.trackedReplies[0];
+
+				expect(finals).toEqual([{ id: ref.id, summary: "Turn answer" }]);
+				expect(AgentRegistry.global().get(ref.id)?.status).toBe("idle");
+			} finally {
+				unsubscribe();
+				AgentLifecycleManager.resetGlobalForTests();
+				AgentRegistry.resetGlobalForTests();
+				IrcBus.resetGlobalForTests();
+			}
 		});
 
 		it("relays the attributed provider error when the wake turn fails", async () => {

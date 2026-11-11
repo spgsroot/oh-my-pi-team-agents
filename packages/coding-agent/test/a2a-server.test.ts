@@ -13,15 +13,21 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { buildAgentCard } from "@oh-my-pi/pi-coding-agent/a2a/card";
-import { A2aAgentBridge } from "@oh-my-pi/pi-coding-agent/a2a/agent-bridge";
+import { addA2aAgentsFromUrl, A2aAgentBridge } from "@oh-my-pi/pi-coding-agent/a2a/agent-bridge";
+import {
+	IncomingRequests,
+	type IncomingRequestLease,
+	type IncomingRequestsApi,
+} from "@oh-my-pi/pi-coding-agent/a2a/incoming-requests";
 import { type OutgoingRequest, OutgoingRequests } from "@oh-my-pi/pi-coding-agent/a2a/outgoing-requests";
 import {
-	type A2aIncomingRequest,
+	A2A_ARTIFACT_MAX_CHARS,
 	type A2aTask,
 	RPC_ERRORS,
 	TASK_STATE,
 	mapAgentStatus,
 	taskFromAgentRef,
+	sendA2aMessage,
 } from "@oh-my-pi/pi-coding-agent/a2a/rpc";
 import {
 	A2A_HOST,
@@ -36,6 +42,9 @@ import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { SpawnSubagentOptions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { IrcBridge } from "@oh-my-pi/pi-coding-agent/session/irc-bridge";
+import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import {
 	AgentRegistry,
 	type AgentRegistryApi,
@@ -43,6 +52,8 @@ import {
 	type RegistryEvent,
 	type RegistryListener,
 } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import type { AgentSessionHandle } from "@oh-my-pi/pi-coding-agent/session/agent-session-handle";
 import { SpawnPendingError, spawnSubagentViaExecutor } from "@oh-my-pi/pi-coding-agent/task/spawn-subagent";
 import { cfgA2aEnabled, cfgA2aPort } from "@oh-my-pi/pi-coding-agent/task/settings";
 import {
@@ -97,9 +108,10 @@ class FakeRegistry {
 		return () => this.#listeners.delete(listener);
 	}
 
-	setStatus(id: string, status: AgentRef["status"]): boolean {
+	setStatus(id: string, status: AgentRef["status"], expected?: AgentRef): boolean {
 		const ref = this.#refs.get(id);
 		if (!ref) return false;
+		if (expected !== undefined && ref !== expected) return false;
 		const previousStatus = ref.status;
 		const leftRunning = previousStatus === "running";
 		ref.status = status;
@@ -135,6 +147,15 @@ class FakeRegistry {
 	insert(ref: AgentRef, notify = true): void {
 		this.#refs.set(ref.id, ref);
 		if (notify) this.#emit({ type: "registered", ref });
+	}
+
+	/** Attach a live session the way AgentRegistry.attachSession does, when the exact ref still owns the id. */
+	attachSession(id: string, session: AgentRef["session"], sessionFile?: string | null, expected?: AgentRef): boolean {
+		const ref = this.#refs.get(id);
+		if (!ref || (expected !== undefined && ref !== expected)) return false;
+		ref.session = session;
+		if (sessionFile !== undefined) ref.sessionFile = sessionFile;
+		return true;
 	}
 
 	/** Drop a ref the way AgentRegistry.unregister does, including the removed event. */
@@ -181,6 +202,7 @@ const handles: A2aServerHandle[] = [];
 afterEach(() => {
 	while (handles.length > 0) handles.pop()?.stop();
 	vi.useRealTimers();
+	IncomingRequests.resetGlobalForTests();
 	OutgoingRequests.resetGlobalForTests();
 });
 
@@ -190,7 +212,7 @@ function startServer(options: {
 	registry?: FakeRegistry;
 	bus?: FakeBus;
 	streamPollMs?: number;
-	onIncomingRequest?: (request: A2aIncomingRequest) => void;
+	incoming?: IncomingRequestsApi;
 }): { handle: A2aServerHandle; registry: FakeRegistry; bus: FakeBus } {
 	const registry = options.registry ?? new FakeRegistry(options.refs ?? []);
 	const bus = options.bus ?? new FakeBus();
@@ -201,7 +223,7 @@ function startServer(options: {
 		bus,
 		spawn: options.spawn,
 		streamPollMs: options.streamPollMs ?? 20,
-		onIncomingRequest: options.onIncomingRequest,
+		incoming: options.incoming ?? new IncomingRequests(),
 		card: () =>
 			buildAgentCard({
 				url: `http://${A2A_HOST}:${handle.port}/`,
@@ -462,6 +484,81 @@ describe("A2A JSON-RPC methods", () => {
 		expect(errorResult(missing.json).code).toBe(RPC_ERRORS.TASK_NOT_FOUND);
 	});
 
+	describe("output artifact cap is Unicode code points", () => {
+		/** Serve a ref whose published output is `text`, then GetTask it as an artifact. */
+		async function artifactFor(text: string): Promise<string> {
+			const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-a2a-cap-"));
+			try {
+				const outputPath = path.join(dir, "beta.md");
+				await fs.writeFile(outputPath, text, "utf8");
+				const registry = new FakeRegistry([
+					makeRef({
+						id: "beta",
+						status: "idle",
+						lifecycle: { terminalAt: 1 },
+						history: { outputPath },
+					}),
+				]);
+				const { handle } = startServer({ registry });
+				const { json } = await rpc(handle, { jsonrpc: "2.0", id: 30, method: "GetTask", params: { id: "beta" } });
+				const task = asObject(asObject(json, "response").result, "result") as unknown as A2aTask;
+				const artifacts = task.artifacts as Array<{ artifactId: string; parts: Array<{ text: string }> }>;
+				expect(artifacts).toHaveLength(1);
+				expect(artifacts[0]?.artifactId).toBe("beta:output");
+				return artifacts[0]?.parts[0]?.text ?? "";
+			} finally {
+				await fs.rm(dir, { recursive: true, force: true });
+			}
+		}
+
+		it("artifact cap preserves astral code point at boundary", async () => {
+			const report = "a".repeat(A2A_ARTIFACT_MAX_CHARS - 1) + "😀" + "z";
+			const emitted = await artifactFor(report);
+			// The cut lands exactly at the emoji: the full 😀 survives, "z" is
+			// gone, and no surrogate half-pair was introduced by the slice.
+			expect(emitted).toBe("a".repeat(A2A_ARTIFACT_MAX_CHARS - 1) + "😀");
+			expect([...emitted]).toHaveLength(A2A_ARTIFACT_MAX_CHARS);
+			expect(emitted).not.toContain("z");
+			expect(isWellFormed(emitted)).toBe(true);
+		});
+
+		it("caps ASCII over the limit and keeps under/exact-cap output identical", async () => {
+			// ASCII over cap stays capped at exactly the cap.
+			const over = "x".repeat(A2A_ARTIFACT_MAX_CHARS + 1000);
+			const capped = await artifactFor(over);
+			expect(capped).toBe("x".repeat(A2A_ARTIFACT_MAX_CHARS));
+			// Under and exactly at the cap flow through byte-for-byte.
+			const under = "a".repeat(A2A_ARTIFACT_MAX_CHARS - 1) + "😀";
+			expect(await artifactFor(under)).toBe(under);
+			const exact = "b".repeat(A2A_ARTIFACT_MAX_CHARS);
+			expect(await artifactFor(exact)).toBe(exact);
+		});
+
+		it("keeps exactly the cap of full emoji for all-astral output over the limit", async () => {
+			const emoji = "😀".repeat(A2A_ARTIFACT_MAX_CHARS + 2);
+			const emitted = await artifactFor(emoji);
+			expect([...emitted]).toHaveLength(A2A_ARTIFACT_MAX_CHARS);
+			expect(emitted.endsWith("😀")).toBe(true);
+			expect(isWellFormed(emitted)).toBe(true);
+		});
+
+		function isWellFormed(text: string): boolean {
+			for (let index = 0; index < text.length; index++) {
+				const unit = text.charCodeAt(index);
+				const high = unit >= 0xd800 && unit <= 0xdbff;
+				const low = unit >= 0xdc00 && unit <= 0xdfff;
+				if (high) {
+					const next = text.charCodeAt(index + 1);
+					if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+					index += 1;
+				} else if (low) {
+					return false;
+				}
+			}
+			return true;
+		}
+	});
+
 	it("ListTasks lists the registry with pagination metadata", async () => {
 		const { handle } = startServer({
 			refs: [makeRef({ id: "beta", status: "running" }), makeRef({ id: "alpha", status: "running" })],
@@ -716,27 +813,160 @@ describe("A2A delivery ingress", () => {
 		return handle;
 	}
 
-	it("tracks replies only for successfully delivered peer requests", async () => {
-		const incoming: string[] = [];
+	it("fast recipient can claim request before send receipt resolves", async () => {
+		const base = new IncomingRequests();
+		const gate = Promise.withResolvers<void>();
+		const notedFirst = Promise.withResolvers<void>();
+		let sendEntered = false;
+		const incoming: IncomingRequestsApi = {
+			// Gate `note`: the dispatch must not enter the bus send until it resolves.
+			note: request => {
+				notedFirst.resolve();
+				return gate.promise.then(() => base.note(request));
+			},
+			consume: match => base.consume(match),
+			confirm: leaseId => base.confirm(leaseId),
+			release: leaseId => base.release(leaseId),
+			discard: match => base.discard(match),
+			list: to => base.list(to),
+		};
 		const bus = new FakeBus();
+		let claimedBeforeReceipt = false;
+		let replyDelivered: string | undefined;
+		bus.send = async msg => {
+			sendEntered = true;
+			bus.sent.push({ from: msg.from, to: msg.to, body: msg.body });
+			// A fast recipient wakes synchronously inside the bus delivery: it
+			// claims the just-addressed request and completes a correlated
+			// answer before the send receipt resolves.
+			const lease = await base.consume({ to: "Main", from: "peer" });
+			claimedBeforeReceipt = lease?.request.messageId === "fast-1" && lease.request.from === "peer";
+			const sent: string[] = [];
+			await sendA2aMessage(
+				{
+					message: { messageId: "answer-1", role: "ROLE_USER", parts: [{ text: "the answer" }] },
+					metadata: { to: "Peer", from: "Main", inReplyTo: lease?.request.messageId },
+				},
+				{
+					registry: {
+						get: (id: string) => (id === "Peer" ? makeRef({ id: "Peer", status: "running" }) : undefined),
+						list: () => [],
+						setStatus: () => false,
+					},
+					send: async reply => {
+						sent.push(reply.body);
+						return { to: reply.to, outcome: "injected" };
+					},
+					incoming: base,
+				},
+			);
+			replyDelivered = sent[0];
+			return { to: msg.to, outcome: "woken" };
+		};
 		const { handle } = startServer({
 			refs: [makeRef({ id: "Main", kind: "main", status: "running" })],
 			bus,
-			onIncomingRequest: request => incoming.push(`${request.from}:${request.messageId}->${request.to}`),
+			incoming,
 		});
-		const send = (id: string) =>
-			rpc(handle, {
-				jsonrpc: "2.0",
-				id,
-				method: "SendMessage",
-				params: { message: { messageId: id, parts: [{ text: "hello" }] }, metadata: { to: "Main", from: "peer" } },
-			});
+		const pending = rpc(handle, {
+			jsonrpc: "2.0",
+			id: "fast-1",
+			method: "SendMessage",
+			params: {
+				message: { messageId: "fast-1", role: "ROLE_USER", parts: [{ text: "hello" }] },
+				metadata: { to: "Main", from: "peer" },
+			},
+		});
+		// The dispatch is parked inside `note` on an unresolved gate, so the
+		// bus send cannot have entered: the record is being made before delivery.
+		await notedFirst.promise;
+		expect(sendEntered).toBe(false);
+		gate.resolve();
+		const { status, json } = await pending;
+		expect(status).toBe(200);
+		expect(taskResult(json).metadata?.delivery).toMatchObject({ to: "Main", outcome: "woken" });
+		// The recipient saw and claimed the request before the receipt existed.
+		expect(claimedBeforeReceipt).toBe(true);
+		// Its correlated answer completed before the receipt resolved.
+		expect(replyDelivered).toContain("[A2A reply to your request fast-1");
+		expect(replyDelivered).toContain("the answer");
+		// The reply created no new incoming request on either side.
+		expect(await base.list("Main")).toEqual([]);
+		expect(await base.list("Peer")).toEqual([]);
+		await expect(base.consume({ to: "Main", from: "peer" })).resolves.toBeUndefined();
+	});
+
+	it("refused delivery discards only its incoming request", async () => {
+		const incoming = new IncomingRequests();
+		const bus = new FakeBus();
 		bus.outcome = "failed";
-		await send("failed");
-		expect(incoming).toEqual([]);
-		bus.outcome = "woken";
-		await send("delivered");
-		expect(incoming).toEqual(["peer:delivered->Main"]);
+		bus.error = "agent Main has no live session";
+		let lease: IncomingRequestLease | undefined;
+		bus.send = async msg => {
+			bus.sent.push({ from: msg.from, to: msg.to, body: msg.body });
+			lease = await incoming.consume({ to: "Main", from: "peer" });
+			return { to: msg.to, outcome: "failed", error: bus.error };
+		};
+		const { handle } = startServer({
+			refs: [makeRef({ id: "Main", kind: "main", status: "running" })],
+			bus,
+			incoming,
+		});
+		// An unrelated queued request from another peer must survive the rollback.
+		await incoming.note({ to: "Main", from: "other", messageId: "kept", at: 1 });
+		const { status, json } = await rpc(handle, {
+			jsonrpc: "2.0",
+			id: "refused",
+			method: "SendMessage",
+			params: {
+				message: { messageId: "refused-1", role: "ROLE_USER", parts: [{ text: "hello" }] },
+				metadata: { to: "Main", from: "peer" },
+			},
+		});
+		expect(status).toBe(200);
+		const error = errorResult(json);
+		expect(error.code).toBe(RPC_ERRORS.DELIVERY_FAILED);
+		expect(error.message).toContain("agent Main has no live session");
+		// The refused request was rolled back; the queued one is retained, and
+		// a discarded lease token cannot resurrect the removed record.
+		expect((await incoming.list("Main")).map(request => request.messageId)).toEqual(["kept"]);
+		await expect(incoming.consume({ to: "Main", from: "peer" })).resolves.toBeUndefined();
+		expect(lease).toBeDefined();
+		expect(await incoming.release(lease!.leaseId)).toBe(false);
+		expect(await incoming.confirm(lease!.leaseId)).toBe(false);
+		expect((await incoming.list("Main")).map(request => request.messageId)).toEqual(["kept"]);
+	});
+
+	it("throwing delivery invalidates a pending claim", async () => {
+		const incoming = new IncomingRequests();
+		const bus = new FakeBus();
+		let lease: IncomingRequestLease | undefined;
+		bus.send = async msg => {
+			bus.sent.push({ from: msg.from, to: msg.to, body: msg.body });
+			lease = await incoming.consume({ to: "Main", from: "peer" });
+			throw new Error("bus transport exploded");
+		};
+		const { handle } = startServer({
+			refs: [makeRef({ id: "Main", kind: "main", status: "running" })],
+			bus,
+			incoming,
+		});
+		const { status, json } = await rpc(handle, {
+			jsonrpc: "2.0",
+			id: "thrown",
+			method: "SendMessage",
+			params: {
+				message: { messageId: "thrown-1", role: "ROLE_USER", parts: [{ text: "hello" }] },
+				metadata: { to: "Main", from: "peer" },
+			},
+		});
+		expect(status).toBe(500);
+		expect(errorResult(json).message).toContain("bus transport exploded");
+		expect(await incoming.list("Main")).toEqual([]);
+		expect(lease).toBeDefined();
+		// The recipient claimed before the throw; the discard invalidates it.
+		expect(await incoming.release(lease!.leaseId)).toBe(false);
+		expect(await incoming.confirm(lease!.leaseId)).toBe(false);
 	});
 
 	it("marks bridge deliveries external: a repeated or bursty request is not agent-guarded", async () => {
@@ -1426,7 +1656,10 @@ describe("A2A pending spawn lifecycle", () => {
 			const sent = await rpc(handle, sendPending("m-send", "ctx-pending"));
 			expect(taskResult(sent.json).status.state).toBe(TASK_STATE.SUBMITTED);
 
+			// The seam resolves its promise only once the registry holds the
+			// ref, so the legitimate resolution registers before settling.
 			const ref = makeRef({ id, status: "running", createdAt: 1_500, activity: "booting" });
+			registry.insert(ref);
 			registration.resolve(ref);
 			await registration.promise;
 
@@ -1434,8 +1667,6 @@ describe("A2A pending spawn lifecycle", () => {
 			expect(got.status.state).toBe(TASK_STATE.WORKING);
 			expect(got.contextId).toBe("ctx-pending");
 			await sse.until(text => text.includes("TASK_STATE_WORKING"));
-
-			registry.insert(ref);
 			const listed = listResult(
 				(await rpc(handle, { jsonrpc: "2.0", id: 3, method: "ListTasks", params: {} })).json,
 			);
@@ -1565,7 +1796,10 @@ describe("A2A pending spawn lifecycle", () => {
 		replaced.registration.resolve(owned);
 		await replaced.registration.promise;
 		expect(replacementAborts).toBe(0);
-		expect(ownedAborts).toBe(1);
+		// A settlement to a ref the registry no longer holds is the removal
+		// transition: the pending cancel dies with the discarded row and
+		// aborts neither the replacement nor the removed generation.
+		expect(ownedAborts).toBe(0);
 		expect(replaced.registry.get(id)?.status).toBe("running");
 		const live = rpcTask(
 			(await rpc(replaced.handle, { jsonrpc: "2.0", id: 4, method: "GetTask", params: { id } })).json,
@@ -1582,9 +1816,10 @@ describe("A2A pending spawn lifecycle", () => {
 		const sse = (await openSpawnStream(handle, "m-evict", "ctx-pending")).sse;
 		try {
 			await sse.until(text => text.includes("TASK_STATE_SUBMITTED"));
+			// The seam resolves its promise only once the registry holds the ref.
+			registry.insert(ref);
 			registration.resolve(ref);
 			await registration.promise;
-			registry.insert(ref);
 			await sse.until(text => text.includes("TASK_STATE_WORKING"));
 
 			expect(registry.unregister(id)).toBe(true);
@@ -1632,6 +1867,105 @@ describe("A2A pending spawn lifecycle", () => {
 		expect(ownedAborts).toBe(1);
 		expect(staleAborts).toBe(0);
 		expect(registry.get(id)?.status).toBe("aborted");
+	});
+
+	it("registration removed in the same turn never reappears through pending snapshot", async () => {
+		const id = "Spawn-late";
+		const { handle, registration, registry } = pendingServer(id, [
+			makeRef({ id: "alpha", createdAt: 1_000, status: "running" }),
+		]);
+		const ref = makeRef({ id, status: "running", createdAt: 1_500, activity: "booting" });
+		const sse = (await openSpawnStream(handle, "m-same-turn", "ctx-pending")).sse;
+		try {
+			await sse.until(text => text.includes("TASK_STATE_SUBMITTED"));
+			const sent = await rpc(handle, sendPending("m-send", "ctx-pending"));
+			expect(taskResult(sent.json).status.state).toBe(TASK_STATE.SUBMITTED);
+
+			// The exact ref registers and is removed before the registration
+			// promise's `.then` callback runs: the ledger must not resolve the
+			// pending row into the removed generation.
+			registry.insert(ref);
+			registration.resolve(ref);
+			expect(registry.unregister(id)).toBe(true);
+			await registration.promise;
+
+			const missing = await rpc(handle, { jsonrpc: "2.0", id: 2, method: "GetTask", params: { id } });
+			expect(errorResult(missing.json).code).toBe(RPC_ERRORS.TASK_NOT_FOUND);
+			const listed = listResult(
+				(await rpc(handle, { jsonrpc: "2.0", id: 3, method: "ListTasks", params: {} })).json,
+			);
+			expect(listed.tasks.map(task => task.id)).toEqual(["alpha"]);
+			await sse.toEnd();
+			expect(
+				sseStatusUpdates(sse.text).filter(update => update.state === TASK_STATE.FAILED && update.final),
+			).toHaveLength(1);
+		} finally {
+			sse.cancel();
+		}
+	});
+
+	it("pending cancel cannot affect replacement registered before promise settlement", async () => {
+		const id = "Spawn-late";
+		let oldAborts = 0;
+		let replacementAborts = 0;
+		const old = makeRef({
+			id,
+			status: "running",
+			createdAt: 1_500,
+			session: { abort: async () => void (oldAborts += 1) } as never,
+		});
+		const replacement = makeRef({
+			id,
+			status: "running",
+			createdAt: 2_000,
+			activity: "replacement work",
+			session: { abort: async () => void (replacementAborts += 1) } as never,
+		});
+		const { handle, registration, registry } = pendingServer(id, []);
+		const sse = (await openSpawnStream(handle, "m-replace-cancel", "ctx-pending")).sse;
+		try {
+			await sse.until(text => text.includes("TASK_STATE_SUBMITTED"));
+			const canceled = rpcTask(
+				(await rpc(handle, { jsonrpc: "2.0", id: 2, method: "CancelTask", params: { id } })).json,
+			);
+			expect(canceled.status.state).toBe(TASK_STATE.SUBMITTED);
+
+			// The registered old generation is removed and a distinct
+			// replacement ref takes the id, all before the promise settles.
+			registry.insert(old);
+			registration.resolve(old);
+			expect(registry.unregister(id)).toBe(true);
+			registry.insert(replacement);
+			await registration.promise;
+
+			expect(oldAborts).toBe(0);
+			expect(replacementAborts).toBe(0);
+			expect(registry.get(id)).toBe(replacement);
+			expect(registry.get(id)?.status).toBe("running");
+
+			const got = rpcTask((await rpc(handle, { jsonrpc: "2.0", id: 3, method: "GetTask", params: { id } })).json);
+			expect(got.status.state).toBe(TASK_STATE.WORKING);
+			expect(got.status.message?.parts[0]?.text).toBe("replacement work");
+			const listed = listResult(
+				(await rpc(handle, { jsonrpc: "2.0", id: 4, method: "ListTasks", params: {} })).json,
+			);
+			expect(listed.tasks.map(task => task.id)).toEqual([id]);
+			expect(listed.tasks[0]?.status.state).toBe(TASK_STATE.WORKING);
+			// A pending cancel that resolved to a removed generation must not
+			// linger and must not transfer: the id left the bridge's ownership
+			// with the discarded row, so a fresh CancelTask refuses instead of
+			// aborting a replacement ref the bridge never created.
+			const refused = await rpc(handle, { jsonrpc: "2.0", id: 5, method: "CancelTask", params: { id } });
+			expect(errorResult(refused.json).code).toBe(RPC_ERRORS.TASK_NOT_CANCELABLE);
+			expect(oldAborts).toBe(0);
+			expect(replacementAborts).toBe(0);
+			expect(registry.get(id)?.status).toBe("running");
+			// The live replacement owns the stream: no removal-style terminal
+			// failure may be minted for it.
+			expect(sse.text).not.toContain('"final":true');
+		} finally {
+			sse.cancel();
+		}
 	});
 });
 
@@ -1888,6 +2222,101 @@ describe("local bridge registry", () => {
 	});
 });
 
+describe("A2A incoming request cleanup", () => {
+	const REQUEST = (to: string, messageId: string, at: number) => ({ to, from: "peer", messageId, at });
+
+	it("startA2aServer expires and removes requests on the injected ledger", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "a2a-cleanup-"));
+		try {
+			const incoming = new IncomingRequests();
+			const registry = new FakeRegistry([makeRef({ id: "Main", kind: "main", status: "running" })]);
+			const handle = await startA2aServer({
+				settings: Settings.isolated({ "a2a.replyTimeoutMs": 50 }),
+				agentDir: dir,
+				port: 0,
+				registry: registry.asApi(),
+				bus: new FakeBus(),
+				incoming,
+			});
+			handles.push(handle);
+			vi.useFakeTimers();
+			setSystemTime(100);
+			try {
+				// Same absolute `at` for both: a lease claim must not reset the
+				// recipient's reply deadline.
+				await incoming.note(REQUEST("Main", "open", 100));
+				await incoming.note(REQUEST("Main", "held", 100));
+				const held = await incoming.consume({ to: "Main", messageId: "held" }, "w1");
+				vi.advanceTimersByTime(49);
+				expect(Date.now()).toBe(149);
+				expect((await incoming.list("Main")).map(request => request.messageId)).toEqual(["open"]);
+				vi.advanceTimersByTime(1);
+				await Promise.resolve();
+				expect(Date.now()).toBe(150);
+				expect(await incoming.list()).toEqual([]);
+				// Late settlement of the expired lease settles nothing.
+				expect(await incoming.release(held!.leaseId, "w1")).toBe(false);
+				expect(await incoming.confirm(held!.leaseId, "w1")).toBe(false);
+				// Removal of the recipient discards its whole queue on the
+				// same injected ledger, without touching another recipient.
+				await incoming.note(REQUEST("Main", "late", 150));
+				await incoming.note(REQUEST("Other", "kept", 150));
+				registry.unregister("Main");
+				expect(await incoming.list()).toEqual([REQUEST("Other", "kept", 150)]);
+			} finally {
+				vi.useRealTimers();
+				setSystemTime();
+			}
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("a bridge whose startup fails after cleanup installation stops the cleanup", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "a2a-cleanup-fail-"));
+		try {
+			const incoming = new IncomingRequests();
+			let removals = 0;
+			const registry = new FakeRegistry([makeRef({ id: "Main", kind: "main", status: "running" })]);
+			registry.onChange(event => {
+				if (event.type === "removed") removals += 1;
+			});
+			// A non-loopback bind makes `createA2aServer` throw after
+			// `startA2aServer` already installed cleanup on the ledger.
+			await expect(
+				startA2aServer({
+					settings: Settings.isolated({ "a2a.replyTimeoutMs": 50 }),
+					agentDir: dir,
+					host: "0.0.0.0",
+					port: 0,
+					registry: registry.asApi(),
+					bus: new FakeBus(),
+					incoming,
+				}),
+			).rejects.toThrow(/127\.0\.0\.1/);
+			// The failed bridge's cleanup is gone: a later removal and time
+			// advancement on that registry/ledger pair touch nothing.
+			const notedAt = Date.now();
+			await incoming.note(REQUEST("Main", "kept", notedAt));
+			registry.unregister("Main");
+			expect(removals).toBe(1);
+			vi.useFakeTimers();
+			try {
+				// Advancing 60 s past a 50 ms timeout on the same ledger must
+				// not expire the request: the failed bridge's cleanup is gone.
+				vi.advanceTimersByTime(60_000);
+				await Promise.resolve();
+				expect(Date.now() - notedAt).toBeGreaterThan(50);
+				expect((await incoming.list("Main")).map(request => request.messageId)).toEqual(["kept"]);
+			} finally {
+				vi.useRealTimers();
+			}
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("A2A reply envelope", () => {
 	it("delivers the task with a reply-back instruction when metadata.from is present", async () => {
 		const bodies: string[] = [];
@@ -1977,13 +2406,11 @@ describe("A2A reply envelope", () => {
 	it("labels metadata.inReplyTo as a reply without a new envelope or outstanding request", async () => {
 		const bodies: string[] = [];
 		const answers: Array<string | undefined> = [];
-		const incoming: A2aIncomingRequest[] = [];
+		const incoming = new IncomingRequests();
 		const handle = createA2aServer({
 			token: "reply-token-3",
 			port: 0,
-			onIncomingRequest: request => {
-				incoming.push(request);
-			},
+			incoming,
 			registry: {
 				list: () => [],
 				get: id => (id === "Main" ? makeRef({ id: "Main", displayName: "Main", status: "running" }) : undefined),
@@ -2020,9 +2447,60 @@ describe("A2A reply envelope", () => {
 		// No new reply envelope: a reply must not start an unbounded chain.
 		expect(bodies[0]).not.toContain("[A2A task from peer terminal");
 		expect(bodies[0]).not.toContain("spawning the agent");
-		expect(incoming).toEqual([]);
+		expect(await incoming.list("Main")).toEqual([]);
 		// The recipient's footer reads this mark: an answer owes no reply.
 		expect(answers).toEqual(["request-17"]);
+	});
+
+	it("retains the wire request's fromUrl on the incoming request record", async () => {
+		const incoming = new IncomingRequests();
+		const handle = createA2aServer({
+			token: "reply-token-4",
+			port: 0,
+			incoming,
+			registry: {
+				list: () => [],
+				get: id => (id === "Main" ? makeRef({ id: "Main", displayName: "Main", status: "running" }) : undefined),
+				onChange: () => () => {},
+				setStatus: () => false,
+			},
+			bus: {
+				send: async (message: { to: string; body: string }) => {
+					expect(message.body).toContain("do the thing");
+					return { to: message.to, outcome: "injected" as const };
+				},
+			} as never,
+			card: async () => buildAgentCard({ url: "http://127.0.0.1:1/", version: "t", skills: [] }),
+		});
+		handles.push(handle);
+		const response = await fetch(handle.url + "/", {
+			method: "POST",
+			headers: { "content-type": "application/json", authorization: "Bearer reply-token-4" },
+			body: JSON.stringify({
+				jsonrpc: "2.0",
+				id: 4,
+				method: "SendMessage",
+				params: {
+					message: { messageId: "m-url", role: "ROLE_USER", parts: [{ text: "do the thing" }] },
+					metadata: { to: "Main", from: "alpha", fromUrl: "http://127.0.0.1:7531/" },
+				},
+			}),
+		});
+		expect(response.status).toBe(200);
+		// The ledger record carries the actual wire request's fromUrl, so a
+		// later automatic reply can pin the originating endpoint.
+		expect(await incoming.list("Main")).toEqual([
+			{
+				from: "alpha",
+				messageId: "m-url",
+				to: "Main",
+				at: expect.any(Number),
+				fromUrl: "http://127.0.0.1:7531/",
+			},
+		]);
+		// A claim leases that exact record, fromUrl included.
+		const lease = await incoming.consume({ to: "Main", messageId: "m-url" });
+		expect(lease?.request.fromUrl).toBe("http://127.0.0.1:7531/");
 	});
 });
 
@@ -2039,10 +2517,10 @@ describe("A2A outgoing reply correlation", () => {
 	}
 
 	function start() {
-		const incoming: A2aIncomingRequest[] = [];
+		const incoming = new IncomingRequests();
 		const started = startServer({
 			refs: [makeRef({ id: "Main", displayName: "Main Alias", kind: "main", status: "running" })],
-			onIncomingRequest: noted => incoming.push(noted),
+			incoming,
 		});
 		return { ...started, incoming };
 	}
@@ -2078,7 +2556,7 @@ describe("A2A outgoing reply correlation", () => {
 		expect(status).toBe(200);
 		expect(deliveryOutcome(json)).toBe("injected");
 		expect(bus.sent).toEqual([]);
-		expect(incoming).toEqual([]);
+		expect(await incoming.list()).toEqual([]);
 		expect(await waiting).toBe("exact reply");
 		expect(OutgoingRequests.global().hasOwner("owner-a")).toBe(false);
 	});
@@ -2098,7 +2576,7 @@ describe("A2A outgoing reply correlation", () => {
 			expect.stringContaining("missing sender"),
 			expect.stringContaining("unknown id"),
 		]);
-		expect(incoming).toEqual([]);
+		expect(await incoming.list()).toEqual([]);
 		let settled = false;
 		void waiting.then(
 			() => {
@@ -2150,36 +2628,438 @@ describe("A2A outgoing reply correlation", () => {
 });
 
 describe("agent card skill filtering", () => {
-	it("lists only the main agent and running subagents; finished workers stay off the card", async () => {
-		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-a2a-filter-"));
+	/**
+	 * The A2A-1 card contract: Main first, then running, then addressable
+	 * kept-alive idle, then revivable parked — each group newest activity
+	 * first, id as the tie-breaker. Advisors, aborted agents, completed
+	 * one-shot corpses and unrevivable parked refs stay off the card, and
+	 * `a2a.maxPeerSkills` cuts AFTER the ordering.
+	 */
+	it("card orders reachable kept-alive agents before applying maxPeerSkills", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-a2a-order-"));
 		try {
+			// Distinct lastActivity values pin the newest-first order inside
+			// each group; the two parked refs share one to pin the id tie-break.
+			const base = Date.now();
 			const registry = new FakeRegistry([
-				makeRef({ id: "Main", displayName: "Main", kind: "main", status: "running" }),
-				makeRef({ id: "LiveWorker", displayName: "Live Worker", kind: "sub", status: "running" }),
-				makeRef({ id: "DoneWorker", displayName: "Done Worker", kind: "sub", status: "idle" }),
-				makeRef({ id: "ParkedWorker", displayName: "Parked Worker", kind: "sub", status: "parked" }),
-				makeRef({ id: "AbortedWorker", displayName: "Aborted Worker", kind: "sub", status: "aborted" }),
+				makeRef({ id: "Main", displayName: "Main", kind: "main", status: "running", lastActivity: base }),
+				// running group: newest activity first.
+				makeRef({ id: "RunOld", displayName: "Run Old", kind: "sub", status: "running", lastActivity: base - 500 }),
+				makeRef({ id: "RunNew", displayName: "Run New", kind: "sub", status: "running", lastActivity: base }),
+				// kept-alive idle group: a live session makes the ref addressable
+				// (IRC wake). A finished turn's published output does NOT retire it.
+				makeRef({
+					id: "IdleOld",
+					kind: "sub",
+					status: "idle",
+					lastActivity: base - 400,
+					session: {} as never,
+					history: { outputPath: "/tmp/idle-old-report.md" },
+				}),
+				makeRef({ id: "IdleNew", kind: "sub", status: "idle", lastActivity: base, session: {} as never }),
+				// supported parked: a transcript the persisted factory can revive.
+				makeRef({
+					id: "ParkedNew",
+					kind: "sub",
+					status: "parked",
+					lastActivity: base - 300,
+					sessionFile: path.join(dir, "ParkedNew.jsonl"),
+				}),
+				makeRef({
+					id: "ParkedOld",
+					kind: "sub",
+					status: "parked",
+					lastActivity: base - 300,
+					sessionFile: path.join(dir, "ParkedOld.jsonl"),
+				}),
+				// unsupported parked: no transcript to revive from.
+				makeRef({ id: "ParkedDead", kind: "sub", status: "parked", lastActivity: base }),
+				// excluded kinds and terminal corpses.
+				makeRef({ id: "AdvisorX", kind: "advisor", status: "idle", lastActivity: base }),
+				makeRef({ id: "AbortedX", kind: "sub", status: "aborted", lastActivity: base }),
+				// completed one-shot corpse: idle with no live session and a
+				// published output — finished, not kept alive, not wakeable.
+				makeRef({
+					id: "OneShot",
+					kind: "sub",
+					status: "idle",
+					lastActivity: base,
+					lifecycle: { terminalAt: base },
+					history: { outputPath: "/tmp/one-shot.md" },
+				}),
 			]);
-			const handle = await startA2aServer({
-				settings: Settings.isolated(),
-				agentDir: dir,
-				port: 0,
-				name: "Main",
-				registry: registry.asApi(),
-				bus: new FakeBus(),
-			});
-			handles.push(handle);
-			const body = (await (await fetch(`${handle.url}${AGENT_CARD_PATH}`)).json()) as {
-				skills: Array<{ id: string }>;
+			// A lifecycle managing this registry proves actual parked revive
+			// capability: its persisted factory builds a reviver exactly for
+			// refs that carry a session file.
+			const lifecycle = new AgentLifecycleManager(registry.asApi());
+			lifecycle.setPersistedSubagentReviverFactory(
+				ref =>
+					ref.sessionFile ? Promise.resolve(async () => ({}) as AgentSessionHandle) : Promise.resolve(undefined),
+				() => 0,
+			);
+			const startCardServer = async (settings: Settings): Promise<A2aServerHandle> => {
+				const handle = await startA2aServer({
+					settings,
+					agentDir: dir,
+					port: 0,
+					name: "Main",
+					registry: registry.asApi(),
+					bus: new FakeBus(),
+					lifecycle,
+				});
+				handles.push(handle);
+				return handle;
 			};
-			const ids = body.skills.map(skill => skill.id);
-			expect(ids).toContain("Main");
-			expect(ids).toContain("LiveWorker");
-			expect(ids).not.toContain("DoneWorker");
-			expect(ids).not.toContain("ParkedWorker");
-			expect(ids).not.toContain("AbortedWorker");
+			const cardSkills = async (handle: A2aServerHandle): Promise<Array<{ id: string }>> => {
+				const body = (await (await fetch(`${handle.url}${AGENT_CARD_PATH}`)).json()) as {
+					skills: Array<{ id: string }>;
+				};
+				return body.skills;
+			};
+			// Default cap (8) keeps the full ordered roster: Main, running by
+			// newest activity, kept-alive idle, then supported parked by id.
+			const full = await startCardServer(Settings.isolated());
+			expect((await cardSkills(full)).map(skill => skill.id)).toEqual([
+				"Main",
+				"RunNew",
+				"RunOld",
+				"IdleNew",
+				"IdleOld",
+				"ParkedNew",
+				"ParkedOld",
+			]);
+			// The public card carries only skill fields: no transcript paths,
+			// no output artifacts, no prompts.
+			const text = JSON.stringify(await (await fetch(`${full.url}${AGENT_CARD_PATH}`)).json());
+			expect(text).not.toContain(dir);
+			expect(text).not.toContain("/tmp/one-shot.md");
+			expect(text).not.toContain("sessionFile");
+			expect(text).not.toContain("outputPath");
+			expect(text).not.toContain("systemPrompt");
+			// A cap below the roster size cuts AFTER the ordering, across
+			// status groups: the newest groups survive, the rest fall off.
+			const capped = await startCardServer(Settings.isolated({ "a2a.maxPeerSkills": 4 }));
+			expect((await cardSkills(capped)).map(skill => skill.id)).toEqual(["Main", "RunNew", "RunOld", "IdleNew"]);
+			// A peer registering from that capped card sees the same capped
+			// order through the registration cap as defense in depth.
+			const bridge = new A2aAgentBridge();
+			await addA2aAgentsFromUrl({ bridge, url: capped.url, token: TOKEN, maxPeerSkills: 4 });
+			expect(bridge.list().map(agent => agent.skillId)).toEqual(["Main", "RunNew", "RunOld", "IdleNew"]);
 		} finally {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("a2a addressed delivery to reachable idle and parked agents", () => {
+	/**
+	 * One idle kept-alive child behind a REAL bus and IRC bridge: the ref's
+	 * session delegates `deliverIrcMessage` to an `IrcBridge` host that wakes
+	 * a turn, so the A2A → IRC → wake path is exercised end-to-end.
+	 */
+	function idleChildHarness() {
+		const woken: CustomMessage[][] = [];
+		const bridge = new IrcBridge({
+			isDisposed: () => false,
+			isStreaming: () => false,
+			planModeEnabled: () => false,
+			hasWakeRelay: () => true,
+			emitSessionEvent: async () => {},
+			wakeForIrc: (records: AgentMessage[]) => {
+				woken.push(records as CustomMessage[]);
+			},
+		} as never);
+		const session = {
+			deliverIrcMessage: async (msg: IrcMessage) => bridge.deliver(msg),
+		};
+		return { bridge, session, woken };
+	}
+
+	it("a2a addressed delivery wakes the idle kept-alive agent", async () => {
+		const { session, woken } = idleChildHarness();
+		const registry = new FakeRegistry([
+			makeRef({ id: "Main", kind: "main", status: "idle" }),
+			makeRef({
+				id: "IdleChild",
+				kind: "sub",
+				status: "idle",
+				session: session as never,
+				// A finished turn's published output must not retire the ref.
+				history: { outputPath: "/tmp/idle-child.md" },
+			}),
+		]);
+		const spawnCalls: SpawnSubagentOptions[] = [];
+		// A real bus: its #deliver resolves the ref, finds the live session,
+		// and calls deliverIrcMessage, which wakes through the IRC bridge.
+		const bus = new IrcBus(registry.asApi(), undefined, { settings: Settings.isolated({}) });
+		const handle = createA2aServer({
+			token: TOKEN,
+			port: 0,
+			registry: registry.asApi(),
+			bus,
+			spawn: async options => {
+				spawnCalls.push(options);
+				throw new Error("delivery must not spawn a fresh agent");
+			},
+			card: () => buildAgentCard({ url: `http://${A2A_HOST}:${handle.port}/`, version: "18.16.0", skills: [] }),
+		});
+		handles.push(handle);
+		const { status, json } = await rpc(handle, {
+			jsonrpc: "2.0",
+			id: "idle-wake",
+			method: "SendMessage",
+			params: {
+				message: { messageId: "wake-1", role: "ROLE_USER", parts: [{ text: "please check the build" }] },
+				metadata: { to: "IdleChild", from: "peer" },
+			},
+		});
+		expect(status).toBe(200);
+		// The SAME idle child received the request through the real bus, was
+		// woken exactly once, and no fresh spawn happened.
+		expect(woken).toHaveLength(1);
+		expect((woken[0]?.[0] as CustomMessage | undefined)?.details).toMatchObject({
+			external: true,
+			a2aMessageId: "wake-1",
+		});
+		expect(spawnCalls).toEqual([]);
+		const task = taskResult(json);
+		expect(task.id).toBe("IdleChild");
+		expect(task.metadata?.delivery).toMatchObject({ to: "IdleChild", outcome: "woken" });
+		// The task stays WORKING (a wake turn started), not COMPLETED from a
+		// prior turn's published output.
+		expect(task.status.state).toBe(TASK_STATE.WORKING);
+	});
+
+	it("a2a addressed delivery revives a supported parked agent through the lifecycle", async () => {
+		// A lifecycle managing this registry proves the parked ref's revive
+		// capability; the real bus routes the delivery through ensureLive,
+		// which invokes the installed factory — the same persisted-revive
+		// path the Agent Hub uses (see test/task/persisted-revive.test.ts).
+		const woken: CustomMessage[][] = [];
+		const bridge = new IrcBridge({
+			isDisposed: () => false,
+			isStreaming: () => false,
+			planModeEnabled: () => false,
+			hasWakeRelay: () => true,
+			emitSessionEvent: async () => {},
+			wakeForIrc: (records: AgentMessage[]) => {
+				woken.push(records as CustomMessage[]);
+			},
+		} as never);
+		const revivedSession = {
+			deliverIrcMessage: async (msg: IrcMessage) => bridge.deliver(msg),
+		};
+		const registry = new FakeRegistry([
+			makeRef({ id: "Main", kind: "main", status: "idle" }),
+			makeRef({
+				id: "ParkedChild",
+				kind: "sub",
+				status: "parked",
+				sessionFile: "/tmp/parked-child.jsonl",
+			}),
+		]);
+		const lifecycle = new AgentLifecycleManager(registry.asApi());
+		const reviveCalls: string[] = [];
+		lifecycle.setPersistedSubagentReviverFactory(
+			ref =>
+				ref.sessionFile
+					? Promise.resolve(async expected => {
+							reviveCalls.push(expected.id);
+							// The exact parked ref is claimed by the revive, mirroring
+							// the real persisted path (createAgentSession claims the
+							// ref as running; the lifecycle then transitions it idle).
+							if (registry.get(expected.id) !== expected) throw new Error("stale ref");
+							if (!registry.attachSession(expected.id, revivedSession as never, expected.sessionFile, expected))
+								throw new Error("attach failed");
+							if (!registry.setStatus(expected.id, "running", expected)) throw new Error("claim failed");
+							return revivedSession as never;
+						})
+					: Promise.resolve(undefined),
+			() => 0,
+		);
+		const spawnCalls: SpawnSubagentOptions[] = [];
+		const bus = new IrcBus(registry.asApi(), lifecycle, { settings: Settings.isolated({}) });
+		const handle = createA2aServer({
+			token: TOKEN,
+			port: 0,
+			registry: registry.asApi(),
+			bus,
+			lifecycle,
+			spawn: async options => {
+				spawnCalls.push(options);
+				throw new Error("delivery must not spawn a fresh agent");
+			},
+			card: () => buildAgentCard({ url: `http://${A2A_HOST}:${handle.port}/`, version: "18.16.0", skills: [] }),
+		});
+		handles.push(handle);
+		const { status, json } = await rpc(handle, {
+			jsonrpc: "2.0",
+			id: "parked-revive",
+			method: "SendMessage",
+			params: {
+				message: { messageId: "revive-1", role: "ROLE_USER", parts: [{ text: "resume the review" }] },
+				metadata: { to: "ParkedChild", from: "peer" },
+			},
+		});
+		expect(status).toBe(200);
+		// The ORIGINAL identity was revived (same id, same ref) and received
+		// the request; no fresh spawn, no Main substitution.
+		expect(reviveCalls).toEqual(["ParkedChild"]);
+		expect(woken).toHaveLength(1);
+		expect((woken[0]?.[0] as CustomMessage | undefined)?.details).toMatchObject({
+			external: true,
+			a2aMessageId: "revive-1",
+		});
+		expect(spawnCalls).toEqual([]);
+		const task = taskResult(json);
+		expect(task.id).toBe("ParkedChild");
+		expect(task.metadata?.delivery).toMatchObject({ to: "ParkedChild", outcome: "revived" });
+		// A revived delivery reports WORKING (the revived turn started), not
+		// the prior run's terminal state.
+		expect(task.status.state).toBe(TASK_STATE.WORKING);
+	});
+
+	it("a2a addressed delivery refuses an unrevivable parked agent like an unknown recipient", async () => {
+		const registry = new FakeRegistry([
+			makeRef({ id: "Main", kind: "main", status: "idle" }),
+			makeRef({ id: "DeadParked", kind: "sub", status: "parked", sessionFile: null }),
+		]);
+		const lifecycle = new AgentLifecycleManager(registry.asApi());
+		const bus = new IrcBus(registry.asApi(), lifecycle, { settings: Settings.isolated({}) });
+		const busSend = vi.fn();
+		bus.send = busSend as never;
+		const handle = createA2aServer({
+			token: TOKEN,
+			port: 0,
+			registry: registry.asApi(),
+			bus,
+			lifecycle,
+			card: () => buildAgentCard({ url: `http://${A2A_HOST}:${handle.port}/`, version: "18.16.0", skills: [] }),
+		});
+		handles.push(handle);
+		const { status, json } = await rpc(handle, {
+			jsonrpc: "2.0",
+			id: "parked-dead",
+			method: "SendMessage",
+			params: {
+				message: { messageId: "dead-1", role: "ROLE_USER", parts: [{ text: "resume" }] },
+				metadata: { to: "DeadParked", from: "peer" },
+			},
+		});
+		// The same externally observable unknown-agent contract as a missing id.
+		expect(status).toBe(404);
+		expect(errorResult(json).code).toBe(RPC_ERRORS.TASK_NOT_FOUND);
+		// No wake, no revive, no bus send, and no phantom incoming record.
+		expect(busSend).not.toHaveBeenCalled();
+		const incoming = IncomingRequests.global();
+		expect(await incoming.list("DeadParked")).toEqual([]);
+	});
+
+	it("a2a addressed delivery refuses a ref removed after discovery without a replacement delivery", async () => {
+		const registry = new FakeRegistry([
+			makeRef({ id: "Main", kind: "main", status: "idle" }),
+			makeRef({ id: "GoneChild", kind: "sub", status: "idle", session: {} as never }),
+		]);
+		const bus = new IrcBus(registry.asApi(), undefined, { settings: Settings.isolated({}) });
+		const handle = createA2aServer({
+			token: TOKEN,
+			port: 0,
+			registry: registry.asApi(),
+			bus,
+			card: () => buildAgentCard({ url: `http://${A2A_HOST}:${handle.port}/`, version: "18.16.0", skills: [] }),
+		});
+		handles.push(handle);
+		// The recipient disappears between card discovery and delivery.
+		registry.unregister("GoneChild");
+		const { status, json } = await rpc(handle, {
+			jsonrpc: "2.0",
+			id: "gone-child",
+			method: "SendMessage",
+			params: {
+				message: { messageId: "gone-1", role: "ROLE_USER", parts: [{ text: "resume" }] },
+				metadata: { to: "GoneChild", from: "peer" },
+			},
+		});
+		expect(status).toBe(404);
+		expect(errorResult(json).code).toBe(RPC_ERRORS.TASK_NOT_FOUND);
+		expect(await IncomingRequests.global().list("GoneChild")).toEqual([]);
+	});
+
+	it("a2a addressed delivery to a registered idle corpse fails with DELIVERY_FAILED, not 404", async () => {
+		// A still-registered idle ref with no live session is a legitimate
+		// lookup: the addressed resolution succeeds and the IRC bus then
+		// refuses the hand-off, so the client sees the existing
+		// DELIVERY_FAILED error (HTTP 200), never TASK_NOT_FOUND/404.
+		const registry = new FakeRegistry([
+			makeRef({ id: "Main", kind: "main", status: "idle" }),
+			makeRef({ id: "IdleCorpse", kind: "sub", status: "idle", session: null }),
+		]);
+		const bus = new IrcBus(registry.asApi(), undefined, { settings: Settings.isolated({}) });
+		const handle = createA2aServer({
+			token: TOKEN,
+			port: 0,
+			registry: registry.asApi(),
+			bus,
+			card: () => buildAgentCard({ url: `http://${A2A_HOST}:${handle.port}/`, version: "18.16.0", skills: [] }),
+		});
+		handles.push(handle);
+		const { status, json } = await rpc(handle, {
+			jsonrpc: "2.0",
+			id: "idle-corpse",
+			method: "SendMessage",
+			params: {
+				message: { messageId: "corpse-1", role: "ROLE_USER", parts: [{ text: "resume" }] },
+				metadata: { to: "IdleCorpse", from: "peer" },
+			},
+		});
+		expect(status).toBe(200);
+		const error = errorResult(json);
+		expect(error.code).toBe(RPC_ERRORS.DELIVERY_FAILED);
+		expect(error.message).toContain("no live session");
+		// The refused delivery rolled its incoming record back.
+		expect(await IncomingRequests.global().list("IdleCorpse")).toEqual([]);
+	});
+
+	it("refuses unauthenticated and wrong-token requests to an idle/parked address without waking or reviving", async () => {
+		const { session } = idleChildHarness();
+		const registry = new FakeRegistry([
+			makeRef({ id: "Main", kind: "main", status: "idle" }),
+			makeRef({ id: "IdleChild", kind: "sub", status: "idle", session: session as never }),
+			makeRef({ id: "ParkedChild", kind: "sub", status: "parked", sessionFile: "/tmp/parked-child.jsonl" }),
+		]);
+		const lifecycle = new AgentLifecycleManager(registry.asApi());
+		const ensureLive = vi.fn();
+		lifecycle.ensureLive = ensureLive as never;
+		const bus = new IrcBus(registry.asApi(), lifecycle, { settings: Settings.isolated({}) });
+		const busSend = vi.fn();
+		bus.send = busSend as never;
+		const handle = createA2aServer({
+			token: TOKEN,
+			port: 0,
+			registry: registry.asApi(),
+			bus,
+			lifecycle,
+			card: () => buildAgentCard({ url: `http://${A2A_HOST}:${handle.port}/`, version: "18.16.0", skills: [] }),
+		});
+		handles.push(handle);
+		const request = (to: string) => ({
+			jsonrpc: "2.0" as const,
+			id: "auth-probe",
+			method: "SendMessage",
+			params: {
+				message: { messageId: "auth-1", role: "ROLE_USER" as const, parts: [{ text: "hello" }] },
+				metadata: { to },
+			},
+		});
+		// Authentication happens before any wake, revive, or bus send.
+		for (const to of ["IdleChild", "ParkedChild"]) {
+			const missing = await rpc(handle, request(to), null);
+			expect(missing.status).toBe(401);
+			const wrong = await rpc(handle, request(to), "wrong-token");
+			expect(wrong.status).toBe(401);
+		}
+		expect(ensureLive).not.toHaveBeenCalled();
+		expect(busSend).not.toHaveBeenCalled();
+		expect(await IncomingRequests.global().list("IdleChild")).toEqual([]);
 	});
 });

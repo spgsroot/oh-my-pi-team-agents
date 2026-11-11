@@ -38,8 +38,8 @@ import {
 } from "@oh-my-pi/pi-coding-agent/a2a/server";
 import { type AgentCard, buildAgentCard } from "@oh-my-pi/pi-coding-agent/a2a/card";
 import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
-import { type A2aIncomingRequest, type A2aTask, TASK_STATE, sendA2aMessage } from "@oh-my-pi/pi-coding-agent/a2a/rpc";
-import { IncomingRequests } from "@oh-my-pi/pi-coding-agent/a2a/incoming-requests";
+import { type A2aTask, TASK_STATE, sendA2aMessage } from "@oh-my-pi/pi-coding-agent/a2a/rpc";
+import { IncomingRequests, type IncomingRequestsApi } from "@oh-my-pi/pi-coding-agent/a2a/incoming-requests";
 import { installA2aReplyRelay } from "@oh-my-pi/pi-coding-agent/a2a/reply-relay";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session-events";
 import { type OutgoingRequest, OutgoingRequests } from "@oh-my-pi/pi-coding-agent/a2a/outgoing-requests";
@@ -165,6 +165,10 @@ afterEach(() => {
 	vi.useRealTimers();
 	IncomingRequests.resetGlobalForTests();
 	OutgoingRequests.resetGlobalForTests();
+	// Other files in the shared process install a global job manager without
+	// resetting it; this file's "no implicit global" assertions must not
+	// observe that leftover.
+	AsyncJobManager.resetForTests();
 });
 
 function textOf(result: { content: Array<{ type: string; text?: string }> }): string {
@@ -803,8 +807,8 @@ describe("A2A reply correlation", () => {
 		const incoming = IncomingRequests.global();
 		await incoming.note({ from: "peer", messageId: "first", to: "Main", at: 1 });
 		await incoming.note({ from: "peer", messageId: "second", to: "Main", at: 2 });
-		expect((await incoming.consume({ to: "Main", from: "peer" }))?.messageId).toBe("first");
-		expect((await incoming.consume({ to: "Main", from: "peer" }))?.messageId).toBe("second");
+		expect((await incoming.consume({ to: "Main", from: "peer" }))?.request.messageId).toBe("first");
+		expect((await incoming.consume({ to: "Main", from: "peer" }))?.request.messageId).toBe("second");
 		expect(await incoming.consume({ to: "Main", from: "peer" })).toBeUndefined();
 	});
 
@@ -813,10 +817,12 @@ describe("A2A reply correlation", () => {
 		for (const messageId of ["first", "second", "third"]) {
 			await incoming.note({ from: "peer", messageId, to: "Main", at: 1 });
 		}
-		expect((await incoming.consume({ to: "Main", from: "peer", messageId: "second" }))?.messageId).toBe("second");
+		expect((await incoming.consume({ to: "Main", from: "peer", messageId: "second" }))?.request.messageId).toBe(
+			"second",
+		);
 		expect(await incoming.consume({ to: "Main", from: "peer", messageId: "second" })).toBeUndefined();
 		expect((await incoming.list("Main")).map(request => request.messageId)).toEqual(["first", "third"]);
-		expect((await incoming.consume({ to: "Main", from: "peer" }))?.messageId).toBe("first");
+		expect((await incoming.consume({ to: "Main", from: "peer" }))?.request.messageId).toBe("first");
 	});
 });
 
@@ -1116,7 +1122,7 @@ describe("spawnA2aAgent reply channel (metadata.from/fromUrl)", () => {
 		/** Distinct cwd basenames give in-process terminals distinct auto names. */
 		cwd?: string;
 		inbox: Array<{ to: string; body: string; external?: boolean }>;
-		onIncomingRequest?: (request: A2aIncomingRequest) => void;
+		incoming?: IncomingRequestsApi;
 	}): Promise<A2aServerHandle> {
 		const settings = await Settings.loadIsolated({ inMemory: true, agentDir: options.agentDir });
 		return startA2aServer({
@@ -1124,7 +1130,7 @@ describe("spawnA2aAgent reply channel (metadata.from/fromUrl)", () => {
 			agentDir: options.agentDir,
 			port: 0,
 			...(options.name !== undefined ? { name: options.name } : {}),
-			...(options.onIncomingRequest !== undefined ? { onIncomingRequest: options.onIncomingRequest } : {}),
+			...(options.incoming !== undefined ? { incoming: options.incoming } : {}),
 			registry: conversationRegistry(),
 			bus: recordingBus(options.inbox),
 			session: { cwd: options.cwd ?? options.agentDir, getSessionAgents: () => [] },
@@ -1193,21 +1199,19 @@ describe("spawnA2aAgent reply channel (metadata.from/fromUrl)", () => {
 		await fs.mkdir(builderCwd, { recursive: true });
 		const senderInbox: Array<{ to: string; body: string; external?: boolean }> = [];
 		const remoteInbox: Array<{ to: string; body: string; external?: boolean }> = [];
-		const senderIncoming: A2aIncomingRequest[] = [];
+		const senderIncoming = new IncomingRequests();
 		const builderReplyBridge = new A2aAgentBridge();
 		const sender = await startTerminal({
 			agentDir: dir.path(),
 			cwd: alphaCwd,
 			inbox: senderInbox,
-			onIncomingRequest: request => {
-				senderIncoming.push(request);
-			},
+			incoming: senderIncoming,
 		});
 		const remote = await startTerminal({
 			agentDir: dir.path(),
 			cwd: builderCwd,
 			inbox: remoteInbox,
-			onIncomingRequest: request => void IncomingRequests.global().note(request),
+			incoming: IncomingRequests.global(),
 		});
 		try {
 			const alphaName = (await fetchAgentCard({ url: sender.url })).card.name;
@@ -1238,7 +1242,8 @@ describe("spawnA2aAgent reply channel (metadata.from/fromUrl)", () => {
 				agent: replyTarget!,
 				prompt: "the answer is 42",
 				fromIdentity: { name: builderName, url: remote.url },
-				inReplyTo: (await IncomingRequests.global().consume({ to: "Main", from: replyTarget!.skillId }))?.messageId,
+				inReplyTo: (await IncomingRequests.global().consume({ to: "Main", from: replyTarget!.skillId }))?.request
+					.messageId,
 			});
 			expect(reply.exitCode).toBe(0);
 			expect(senderInbox).toHaveLength(1);
@@ -1251,7 +1256,71 @@ describe("spawnA2aAgent reply channel (metadata.from/fromUrl)", () => {
 			// exchange cannot grow into an unbounded request/reply chain.
 			expect(answer.body).not.toContain("[A2A task from peer terminal");
 			expect(answer.body).not.toContain("spawning the agent");
-			expect(senderIncoming).toEqual([]);
+			expect(await senderIncoming.list("Main")).toEqual([]);
+		} finally {
+			remote.stop();
+			sender.stop();
+		}
+	});
+
+	it("retains fromUrl through the wire so an equal-skill-id sender is pinned to its endpoint", async () => {
+		using dir = TempDir.createSync("@a2a-reply-url-loop-");
+		const alphaCwd = path.join(dir.path(), "alpha");
+		const betaCwd = path.join(dir.path(), "beta");
+		await fs.mkdir(alphaCwd, { recursive: true });
+		await fs.mkdir(betaCwd, { recursive: true });
+		const senderInbox: Array<{ to: string; body: string; external?: boolean }> = [];
+		const senderIncoming = new IncomingRequests();
+		// B's terminal records A's request with its own ledger.
+		const remoteIncoming = new IncomingRequests();
+		const sender = await startTerminal({
+			agentDir: dir.path(),
+			cwd: alphaCwd,
+			inbox: senderInbox,
+			incoming: senderIncoming,
+			name: "alpha",
+		});
+		const remote = await startTerminal({
+			agentDir: dir.path(),
+			cwd: betaCwd,
+			inbox: [],
+			incoming: remoteIncoming,
+			name: "alpha",
+		});
+		try {
+			// Two live terminals advertise the SAME skill id ("alpha") from
+			// distinct endpoints. B registers both.
+			const builderBridge = new A2aAgentBridge();
+			await addA2aAgentsFromUrl({ bridge: builderBridge, url: sender.url, agentDir: dir.path() });
+			await addA2aAgentsFromUrl({ bridge: builderBridge, url: remote.url, agentDir: dir.path() });
+			const sameSkill = builderBridge.list().filter(agent => agent.skillId === "alpha");
+			expect(sameSkill.map(agent => agent.name).sort()).toEqual(["a2a:alpha", "a2a:alpha-2"]);
+
+			// A's request lands on B carrying fromUrl = A's endpoint.
+			const builderTarget = builderBridge.list().find(agent => agent.url === remote.url)!;
+			const outbound = await spawnA2aAgent({
+				agent: builderTarget,
+				prompt: "what is 17+25?",
+				fromIdentity: { name: "alpha", url: sender.url },
+			});
+			expect(outbound.exitCode).toBe(0);
+
+			// The noted request on B carries A's fromUrl from the actual wire
+			// request, so the shared selection pins A's endpoint, not the twin.
+			const noted = (await remoteIncoming.list("Main"))[0]!;
+			expect(noted).toMatchObject({ from: "alpha", fromUrl: sender.url });
+			const reply = await spawnA2aAgent({
+				agent: builderBridge.get("a2a:alpha")!,
+				prompt: "the answer is 42",
+				fromIdentity: { name: "alpha", url: remote.url },
+				inReplyTo: (await remoteIncoming.consume({ to: "Main", from: "alpha", messageId: noted.messageId }))
+					?.request.messageId,
+			});
+			expect(reply.exitCode).toBe(0);
+			expect(senderInbox).toHaveLength(1);
+			expect(senderInbox[0]!.body).toContain("[A2A reply to your request");
+			// The URL-pinned endpoint is A's bridge, so A received the answer.
+			expect(await senderIncoming.list("Main")).toEqual([]);
 		} finally {
 			remote.stop();
 			sender.stop();
@@ -1690,7 +1759,7 @@ async function deliverReply(options: {
 	from?: string;
 	text: string;
 	bus: Array<{ body: string }>;
-	incoming?: A2aIncomingRequest[];
+	incoming?: IncomingRequests;
 }): Promise<A2aTask> {
 	const main = localMainRef();
 	return sendA2aMessage(
@@ -1716,9 +1785,7 @@ async function deliverReply(options: {
 				options.bus.push({ body: message.body });
 				return { to: message.to, outcome: "injected" };
 			},
-			...(options.incoming !== undefined
-				? { noteIncomingRequest: (request: A2aIncomingRequest) => options.incoming?.push(request) }
-				: {}),
+			...(options.incoming !== undefined ? { incoming: options.incoming } : {}),
 			outgoing: OutgoingRequests.global(),
 		},
 	);
@@ -1906,7 +1973,7 @@ describe("addressed A2A reply jobs", () => {
 		try {
 			const call = await seen.promise;
 			const bus: Array<{ body: string }> = [];
-			const incoming: A2aIncomingRequest[] = [];
+			const incoming = new IncomingRequests();
 			await deliverReply({
 				messageId: messageIdOf(call),
 				from: "omp",
@@ -1915,7 +1982,7 @@ describe("addressed A2A reply jobs", () => {
 				incoming,
 			});
 			expect(bus).toEqual([]);
-			expect(incoming).toEqual([]);
+			expect(await incoming.list()).toEqual([]);
 			hold.resolve(rpcResult(1, { task: deliveryTask() }));
 			const result = await executing;
 			const jobId = replyJob(result)?.jobId;
@@ -2231,7 +2298,7 @@ describe("addressed A2A reply jobs", () => {
 		const tool = await createTaskTool(bridge, Settings.isolated(), { asyncJobManager: manager });
 		let listener: ((event: AgentSessionEvent) => void) | undefined;
 		let relaySends = 0;
-		const unsubscribe = installA2aReplyRelay({
+		const relay = installA2aReplyRelay({
 			bridge,
 			subscribe: next => {
 				listener = next;
@@ -2267,12 +2334,12 @@ describe("addressed A2A reply jobs", () => {
 					},
 				],
 			} as AgentSessionEvent);
-			await Bun.sleep(0);
+			await relay.settled();
 			expect(relaySends).toBe(0);
 			expect(server.calls).toHaveLength(1);
 			expect(await IncomingRequests.global().list("Main")).toEqual([]);
 		} finally {
-			unsubscribe();
+			relay.stop();
 		}
 	});
 

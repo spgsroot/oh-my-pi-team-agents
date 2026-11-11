@@ -23,16 +23,13 @@ import type { EffectiveExtensionRoots } from "../capability/types";
 import type { Settings } from "../config/settings";
 import type { SpawnSubagentOptions } from "../extensibility/extensions/types";
 import { type IrcBusApi, IrcBus } from "../irc/bus";
+import { type AgentLifecycleApi, AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID, type AgentRef, type AgentRegistryApi } from "../registry/agent-registry";
-import { discoverAgents } from "../task/discovery";
-import { cfgA2aPort, cfgA2aToken } from "../task/settings";
-import type { AgentDefinition } from "../task/types";
-import { buildAgentCard, type AgentCard } from "./card";
-import { OutgoingRequests } from "./outgoing-requests";
 import {
 	A2A_SENDER_ID,
+	a2aReachableGroup,
 	type A2aDispatchDeps,
-	type A2aIncomingRequest,
+	type A2aReachableGroup,
 	type A2aTask,
 	type JsonRpcFailure,
 	type JsonRpcId,
@@ -43,11 +40,18 @@ import {
 	RpcError,
 	TASK_STATE,
 	TERMINAL_TASK_STATES,
+	discardPendingSpawn,
 	dispatchA2aMethod,
 	failedDeliveryTask,
 	sendA2aMessage,
 	snapshotA2aTask,
 } from "./rpc";
+import type { AgentDefinition } from "../task/types";
+import { discoverAgents } from "../task/discovery";
+import { cfgA2aMaxPeerSkills, cfgA2aPort, cfgA2aReplyTimeoutMs, cfgA2aToken } from "../task/settings";
+import { buildAgentCard, type AgentCard } from "./card";
+import { IncomingRequests, type IncomingRequestsApi } from "./incoming-requests";
+import { OutgoingRequests } from "./outgoing-requests";
 
 /** The bridge never binds anything else: an A2A endpoint on a LAN is an open door. */
 export const A2A_HOST = "127.0.0.1";
@@ -70,14 +74,25 @@ export interface A2aServerOptions {
 	host?: string;
 	/** Public A2A identity: renames the main skill and resolves `to` by name. */
 	name?: string;
-	/** Notified when a peer request with a reply identity is delivered here (A2). */
-	onIncomingRequest?: (request: A2aIncomingRequest) => void;
+	/**
+	 * Incoming-request ledger shared with relays and workers. Omitted resolves
+	 * to the process-wide instance, so every bridge records requests in the
+	 * same ledger the reply paths read.
+	 */
+	incoming?: IncomingRequestsApi;
 	registry: Pick<AgentRegistryApi, "get" | "list" | "onChange" | "setStatus">;
 	bus: A2aBus;
 	spawn?: (options: SpawnSubagentOptions) => Promise<AgentRef>;
 	card: () => AgentCard | Promise<AgentCard>;
 	/** SSE fallback poll for progress that arrives without a registry event. */
 	streamPollMs?: number;
+	/**
+	 * The agent lifecycle owning `registry` (A2A-1). Its revive capability
+	 * gates both which parked refs the card advertises and which addressed
+	 * deliveries resolve; omitted treats every parked ref as addressable and
+	 * leaves the bus's own ensureLive gate to refuse impossible revives.
+	 */
+	lifecycle?: Pick<AgentLifecycleApi, "canRevive" | "manages">;
 }
 
 export interface A2aServerHandle {
@@ -268,6 +283,9 @@ export function createA2aServer(options: A2aServerOptions): A2aServerHandle {
 	/** Every open stream's stop closure: `stop()` closes them, `server.stop` alone does not. */
 	const activeStreams = new Set<() => void>();
 	const pendingSpawns = new PendingSpawnLedger();
+	const canRevive = options.lifecycle?.manages(options.registry)
+		? (ref: AgentRef) => options.lifecycle!.canRevive(ref)
+		: undefined;
 	const dispatchDeps: A2aDispatchDeps = {
 		registry: options.registry,
 		...(options.name !== undefined ? { identityName: options.name } : {}),
@@ -279,8 +297,9 @@ export function createA2aServer(options: A2aServerOptions): A2aServerHandle {
 		createdTaskRefs: new Map<string, AgentRef | undefined>(),
 		contextIds: new Map<string, string>(),
 		pendingSpawns,
-		...(options.onIncomingRequest !== undefined ? { noteIncomingRequest: options.onIncomingRequest } : {}),
+		incoming: options.incoming ?? IncomingRequests.global(),
 		outgoing: OutgoingRequests.global(),
+		...(canRevive !== undefined ? { canRevive } : {}),
 	};
 	const unsubscribe = options.registry.onChange(event => {
 		if (event.type === "removed") {
@@ -288,10 +307,7 @@ export function createA2aServer(options: A2aServerOptions): A2aServerHandle {
 			// dropped. Evict that record so GetTask, ListTasks, and SSE match a
 			// normal unregistration: missing, absent, and one final FAILED.
 			const record = pendingSpawns.get(event.ref.id);
-			if (record?.ref === event.ref) {
-				pendingSpawns.delete(event.ref.id);
-				pendingSpawns.notify(event.ref.id);
-			}
+			if (record?.ref === event.ref) discardPendingSpawn(dispatchDeps, record);
 			return;
 		}
 		if (event.type !== "registered" || !dispatchDeps.createdTaskRefs?.has(event.ref.id)) return;
@@ -533,19 +549,47 @@ export async function startA2aServer(options: StartA2aServerOptions): Promise<A2
 	// A3: a random per-process id mirrored in the served card lets a reader
 	// confirm the port it found still belongs to THIS bridge (pid reuse).
 	const instanceId = randomBytes(16).toString("hex");
+	// The lifecycle owning this registry proves actual parked revive
+	// capability (A2A-1); without one, no parked ref is advertised and the
+	// bus's own ensureLive gate stays the delivery authority.
+	const lifecycle = options.lifecycle ?? AgentLifecycleManager.global();
+	const canReviveParked = lifecycle.manages(registry) ? (ref: AgentRef) => lifecycle.canRevive(ref) : undefined;
+	const maxPeerSkills = Math.max(1, cfgA2aMaxPeerSkills.get(options.settings));
 	const card = async (): Promise<AgentCard> => {
 		if (options.card) return { ...(await options.card()), instanceId };
 		const descriptions = await loadDescriptions();
-		// Only main and live subagents are advertised; finished subagents remain
-		// reachable directly by id without flooding peer rosters.
-		const skills = registry
-			.list()
-			.filter(ref => ref.kind === "main" || ref.status === "running")
-			.map(ref => ({
-				id: ref.id === MAIN_AGENT_ID ? identity : ref.id,
-				displayName: ref.displayName,
-				description: descriptions.get(ref.history?.agent ?? ref.id),
-			}));
+		// A2A-1: advertise every agent this terminal can actually deliver to —
+		// Main first, then running, kept-alive idle, and revivable parked
+		// subagents — each group sorted by newest activity, then id. The cap
+		// applies AFTER the ordering, so it drops the least recently active
+		// reachable agents, never whole status groups. Finished one-shot
+		// corpses, aborted agents, advisors and unrevivable parked refs stay
+		// off the card; they remain addressable only while a delivery path
+		// can still reach them (idle wake / lifecycle revive).
+		const groups = new Map<A2aReachableGroup, AgentRef[]>();
+		for (const ref of registry.list()) {
+			const group = a2aReachableGroup(ref);
+			if (group === undefined) continue;
+			// A kept-alive idle agent is addressable only while its live session
+			// is attached (an IRC wake needs it); a detached idle corpse is a
+			// finished one-shot the card must not advertise.
+			if (group === "idle" && ref.kind === "sub" && ref.session === null) continue;
+			if (group === "parked" && !(canReviveParked?.(ref) ?? false)) continue;
+			const bucket = groups.get(group) ?? [];
+			bucket.push(ref);
+			groups.set(group, bucket);
+		}
+		const ordered: AgentRef[] = [];
+		for (const group of ["main", "running", "idle", "parked"] as const) {
+			const bucket = groups.get(group) ?? [];
+			bucket.sort((a, b) => b.lastActivity - a.lastActivity || a.id.localeCompare(b.id));
+			ordered.push(...bucket);
+		}
+		const skills = ordered.slice(0, maxPeerSkills).map(ref => ({
+			id: ref.id === MAIN_AGENT_ID ? identity : ref.id,
+			displayName: ref.displayName,
+			description: descriptions.get(ref.history?.agent ?? ref.id),
+		}));
 		return buildAgentCard({
 			url: `http://${A2A_HOST}:${handle.port}/`,
 			version: options.version ?? VERSION,
@@ -555,37 +599,59 @@ export async function startA2aServer(options: StartA2aServerOptions): Promise<A2
 		});
 	};
 
-	const handle = createA2aServer({
-		...options,
-		name: identity,
-		port: options.port ?? cfgA2aPort.get(options.settings),
-		token,
-		card,
-	});
-	const agentDir = options.agentDir ?? options.settings.getAgentDir();
-	await registerLocalBridge({
-		agentDir,
-		port: handle.port,
-		name: identity,
-		instanceId,
-	});
-	// A3: remove this process's own discovery file when the bridge stops.
-	return {
-		host: handle.host,
-		port: handle.port,
-		url: handle.url,
-		stop(): void {
-			try {
-				const file = bridgeEntryPath(agentDir, process.pid);
-				const entry: unknown = JSON.parse(syncFs.readFileSync(file, "utf8"));
-				if (isLocalBridgeEntry(entry, process.pid) && entry.instanceId === instanceId)
-					syncFs.rmSync(file, { force: true });
-			} catch {
-				// Discovery cleanup is best effort.
-			}
-			handle.stop();
-		},
-	};
+	// The bridge owns the incoming ledger's maintenance for its lifetime:
+	// recipient removal and reply-deadline expiry. Only the concrete
+	// main-thread ledger carries `startCleanup`; an injected proxy is
+	// maintained by its installer. Workers share main's ledger and never
+	// install a cleanup service of their own.
+	const ledger = options.incoming ?? IncomingRequests.global();
+	const stopCleanup =
+		ledger instanceof IncomingRequests
+			? ledger.startCleanup(registry, cfgA2aReplyTimeoutMs.get(options.settings))
+			: undefined;
+	let handle: A2aServerHandle;
+	try {
+		handle = createA2aServer({
+			...options,
+			name: identity,
+			port: options.port ?? cfgA2aPort.get(options.settings),
+			token,
+			card,
+			incoming: ledger,
+			lifecycle,
+		});
+		const agentDir = options.agentDir ?? options.settings.getAgentDir();
+		await registerLocalBridge({
+			agentDir,
+			port: handle.port,
+			name: identity,
+			instanceId,
+		});
+		// A3: remove this process's own discovery file when the bridge stops,
+		// together with the ledger cleanup this bridge installed.
+		return {
+			host: handle.host,
+			port: handle.port,
+			url: handle.url,
+			stop(): void {
+				try {
+					const file = bridgeEntryPath(agentDir, process.pid);
+					const entry: unknown = JSON.parse(syncFs.readFileSync(file, "utf8"));
+					if (isLocalBridgeEntry(entry, process.pid) && entry.instanceId === instanceId)
+						syncFs.rmSync(file, { force: true });
+				} catch {
+					// Discovery cleanup is best effort.
+				}
+				stopCleanup?.();
+				handle.stop();
+			},
+		};
+	} catch (error) {
+		// A failed startup after cleanup installation must not leave the
+		// subscription or its expiry timer behind on the ledger.
+		stopCleanup?.();
+		throw error;
+	}
 }
 
 /** One registry entry for a locally running bridge; one file per process (A3). */

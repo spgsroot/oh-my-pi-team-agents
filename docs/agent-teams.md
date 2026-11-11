@@ -85,8 +85,9 @@ ID; use the actual ID shown by startup/status and in the rendered peer list for
 cap and reports skipped members. Repeating start skips already recorded live or
 pending members rather than duplicating them. A spawn that has not registered
 within the spawn wait is **pending**, with its reserved ID, not failed merely
-because time elapsed. Registration makes it live; a rejected registration (a run
-ending without registering) is reported as failed by status/stop, and the next
+because time elapsed. Registration makes it live; a rejected registration (a
+run ending without registering, a spawn that fails before it, or a worker lost
+before its ref appears) is reported as failed by status/stop, and the next
 start can retry it.
 
 ## Role prompts and permissions
@@ -184,26 +185,36 @@ malformed ledger rows also fail closed; they are not silently replaced.
 
 ## Idle notices and messaging
 
-On each real `running → idle` transition, the runtime sends the current member's
-actual lead one non-request notice containing the member ID and an
-`agent://<actual-id>` link. When the registered session exposes the completed
-assistant turn, the notice includes its first three lines, capped at 500
-characters. If that turn has no text, the excerpt comes from its final
-`yield`/`handback` call arguments; without either, the summary line is omitted.
-Repeated idle events do not duplicate a notice; a later completed running turn
-produces a new one. A text stop followed by a yield-reminder turn can therefore
-produce two notices. Delayed events from replaced refs or old team generations
-do not notify for replacements. Delivery can fail under the ordinary IRC guard
-or recipient availability constraints.
+When a member's turn finally settles idle — its run reached a terminal decision
+(an accepted `yield`/`handback`, reminders exhausted, or a wake turn ended) —
+the runtime sends the current member's actual lead one non-request notice
+containing the member ID and an `agent://<actual-id>` link. When the registered
+session exposes the completed assistant turn, the notice includes its first
+three lines, capped at 500 characters. If that turn has no text, the excerpt
+comes from its final `yield`/`handback` call arguments; when the run yielded a
+summary, that summary stands in for an empty excerpt. Without either, the
+summary line is omitted. Intermediate running→idle transitions — a structured
+member's first text stop before the executor's yield reminder, or a wake turn's
+run-state mirror idle — do not notify: only the settle does, exactly one notice
+per finished turn. A repeated settle or a later turn produces a fresh notice;
+notices are progress, so dedup does not apply. Delayed events from replaced
+refs or old team generations do not notify for replacements. Delivery can
+fail under the ordinary IRC guard or recipient availability constraints.
 
 Idle notices, plan submissions, approval/rejection notices and stop
 decline/timeout notices are displayed as **team notices, no reply needed**.
-They impose no automatic reply obligation or wake-relay loop. An addressed team
-notice can end a pending `wait`, including a member waiting for plan approval.
-Ordinary progress messages retain their “reply follows later” presentation and
-do not end waits. This is different from ordinary request wake-relay, which
-returns a woken subagent's turn output to the requester and is not an idle
-notification. Direct peer messages keep the existing IRC ingress guard.
+They are informational: they impose no automatic reply obligation or wake-relay
+loop, and they count as neither a reply nor a promise of one. A notice addressed
+to an agent ends that agent's blocked reply `wait`, and a notice to an idle
+member wakes it for a turn, but it never interrupts a wait on its own
+background jobs or services: there it stays queued and is delivered as an aside
+once the wait returns. Submitting a plan asks the lead nothing, so a member's
+`wait` right after `write team://<name>/plan` does not block for the decision;
+the approval or rejection notice reaches the member as a wake turn instead. Ordinary progress messages retain their “reply follows later”
+presentation and do not end waits. This is different from ordinary request
+wake-relay, which returns a woken subagent's turn output to the requester and is
+not an idle notification. Direct peer messages keep the existing IRC ingress
+guard.
 
 ## Cooperative stop
 
@@ -234,7 +245,9 @@ These are alternatives for the same request, not sequential replies:
   leaves the member live.
 - No reply by `team.stopAckTimeoutMs` (default **120000 ms**, two minutes) closes
   the request and notifies the lead once. Timeout never forces release. Values
-  below 1000 ms and non-finite values clamp to 1000 ms.
+  outside 1000..2147483647 ms clamp into that range: Node/Bun `setTimeout`
+  overflows past 2^31-1 ms and would otherwise fire the timeout almost
+  immediately.
 - Late, duplicate, wrong-member and old-generation replies cannot release a
   member. After decline/timeout, issue another stop or explicitly use `--force`.
 
@@ -244,14 +257,24 @@ also released immediately by an ordinary stop: it cannot acknowledge. A release
 already in flight reports `stop already pending` instead of releasing twice.
 For a still-registering spawn, cooperative or forced stop intent is retained
 against its reservation and generation. On registration, the request is sent or
-the exact ref is force-released; registration failure clears the intent and is
-reported. A replacement generation does not inherit old stop intent.
+the exact ref is force-released; a spawn that ends without registering — a
+rejected spawn, an aborted run or a worker lost before its ref appears —
+resolves the intent at once, marks the member failed, and notifies the lead
+(`Stop request for <id> released: never registered (<failure>)`). A
+replacement generation does not inherit old stop intent.
 
 A whole-team stop (by name or `all`) retires that generation when its members
 have been removed, including final acknowledgements and pending force releases.
-A handle-only stop preserves the generation, even if it removes the last member.
-A subsequent whole-team start after retirement gets a fresh generation; a
-workspace ledger survives, whereas the old in-memory ledger does not.
+A handle-only stop, an outside release, a kill or any other removal of the last
+member also retires the emptied generation: the runtime stops it and tells the
+lead once (`Team <name> finished: no members left.`), after which normal
+idle-TTL parking resumes for the lead. A whole-team stop awaiting an
+acknowledgement keeps the generation live; the timeout notice leaves the
+decision to the lead. A subsequent whole-team start after retirement gets a
+fresh generation; a workspace ledger survives, whereas the old in-memory
+ledger does not. Retirement never races a concurrent restart: only the
+generation that still owns the team name is retired, so a new `/team start`
+under the same name is untouched.
 
 A session leading a current team generation is not idle-TTL parked: its timer
 is re-armed so the team, active members and the lead's `/team stop` authority
@@ -259,20 +282,24 @@ remain live. After all its teams retire, normal idle-TTL parking resumes.
 Genuine session termination still retires its generations without changing
 member teardown ownership; Main shutdown leaves cleanup to the lifecycle manager.
 
-Runtime-authored stop requests and approval/rejection notices bypass **only
-sender rate charging**. Stop requests still undergo dedup/hop/delivery checks;
-approval/rejection notices are progress deliveries, which already skip dedup.
-Idle and decline/timeout notices, and agent-authored plan submissions, remain
-rate-limited like ordinary progress messages. All retain hop, membership/ref
-and ordinary delivery/queue checks; this is not an unrestricted messaging bypass.
+Runtime-authored team traffic — stop requests, plan approval/rejection notices,
+and idle, decline, timeout, failed-registration and team-finished notices sent
+on behalf of a member — bypasses **only sender rate charging**. Stop requests
+still undergo dedup/hop/delivery checks; the notices are progress deliveries,
+which already skip dedup. Agent-authored plan submissions remain rate-limited
+like ordinary progress messages. All traffic retains hop, membership/ref and
+ordinary delivery/queue checks; this is not an unrestricted messaging bypass,
+and the `teamControl` flag is set only by runtime code — an agent cannot claim
+the exemption through any tool.
 
 ## Plan submission and approval
 
-Until approval, the exact allowed tool names are `read`, `grep`, `glob`, `lsp`,
-`web_search`, `wait`, terminal reports via `yield`/`handback`, and `write` targeting
-normalized `agent://` or `team://` coordination URLs. This allowlist does not add
-tools a role lacks. Terminal reports let a member finish its current turn while
-awaiting approval; they do not open the mutation gate.
+Until approval, the exact allowed tool names are `read`, `grep`, `glob`, `find`,
+`ast_grep`, `lsp`, `web_search`, `wait`, terminal reports via `yield`/`handback`,
+and `write` targeting normalized `agent://` or `team://` coordination URLs. This
+allowlist does not add tools a role lacks. `find` and `ast_grep` are read-only
+search tools; `ast_edit` is not allowed. Terminal reports let a member finish its
+current turn while awaiting approval; they do not open the mutation gate.
 
 Allowed `lsp` actions are `diagnostics`, `definition`, `type_definition`,
 `implementation`, `references`, `hover`, `symbols`, `status` and `capabilities`.
@@ -295,19 +322,29 @@ as a grant.
 
 1. The member submits non-empty plan text as the content of
    `write team://audit/plan`. Its trusted session identifies the author; the
-   actual lead receives a non-request notification. Failed delivery does not
-   produce an approvable submission.
-2. The lead runs `/team reject Reviewer Explain how you will verify the result`.
-   The member receives the reason, the gate stays closed and the old submission
-   is cleared. It must revise and submit again through the same URL.
-3. The lead runs `/team approve Reviewer`. Approval requires a successfully
-   submitted plan; otherwise it is refused with instructions to submit one.
-   The member receives a non-request approval notice, with no reply required.
+   actual lead receives a non-request notification naming the submission's
+   revision (`rev N`). Failed delivery does not produce an approvable
+   submission.
+2. The lead runs `/team reject Reviewer [--rev N] Explain how you will verify
+   the result`. Like approval, it requires a submitted plan; otherwise it is
+   refused with instructions to submit one. The member receives the reason
+   (with `rev N`), the gate stays closed and the old submission is cleared. It
+   must revise and submit again through the same URL.
+3. The lead runs `/team approve Reviewer [--rev N]`. Approval requires a
+   successfully submitted plan; otherwise it is refused with instructions to
+   submit one. The member receives a non-request approval notice naming the
+   approved revision, with no reply required.
 
 Only the current lead can approve/reject its members. Ambiguous handles,
-nonmembers, stale generations and replaced refs are refused. Approval applies to
-the current submitted plan, not a revision token selected by the command; if a
-member resubmits before approval, the command acts on that latest submission.
+nonmembers, stale generations and replaced refs are refused. The revision
+`N` counts accepted submissions in the member's current generation (1, 2, 3
+…); rejects do not advance it, so the resubmission after a rejected rev 2 is
+rev 3. With `--rev N` the decision is a compare-and-set: if `N` differs from
+the member's current revision, the command is refused with
+`Stale plan revision N; current is M` and nothing changes — the gate stays as
+it was. Without `--rev` the command acts on the current submitted plan, not a
+revision token selected by the command; if a member resubmits before approval,
+the command acts on that latest submission.
 It removes only the team gate, not role restrictions: a writable member can then
 mutate within existing permissions; scout/reviewer remain read-only apart from
 coordination writes. Resubmission resets approval for a member that requires it.
@@ -325,15 +362,15 @@ All `/team` commands require `team.enabled: true`.
 /team start <name> [assignment]
 /team status [name]
 /team stop [--force] <name|handle|all>
-/team approve <handle>
-/team reject <handle> <reason>
+/team approve <handle> [--rev N]
+/team reject <handle> [--rev N] <reason>
 ```
 
 | Setting | Default | Purpose |
 |---|---|---|
 | `team.enabled` | `false` | Enables the experimental `/team` commands. |
 | `team.maxTeammates` | `4` | Caps members selected per start; skipped members are reported. |
-| `team.stopAckTimeoutMs` | `120000` | Cooperative-stop acknowledgement deadline in milliseconds; minimum 1000, with no forced release on timeout. |
+| `team.stopAckTimeoutMs` | `120000` | Cooperative-stop acknowledgement deadline in milliseconds; clamped to 1000..2147483647, with no forced release on timeout. |
 
 ## Source
 

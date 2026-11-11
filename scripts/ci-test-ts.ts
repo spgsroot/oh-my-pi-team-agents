@@ -3,6 +3,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { requireBunVersion } from "./require-bun";
 
 type Mode =
 	| "all"
@@ -18,7 +19,7 @@ type Mode =
 
 type CodingAgentBucket = "singleton" | "ui" | "runtime" | "native";
 
-interface TestCommand {
+export interface TestCommand {
 	label: string;
 	cwd: string;
 	/** argv without `--parallel`; the runner appends it from `parallel` and the pool's CPU budget. */
@@ -105,10 +106,21 @@ const nativeAndIntegrationPackages = [
 	"packages/typescript-edit-benchmark",
 ];
 
+// Every child this runner spawns runs under the same Bun executable that
+// started it (process.execPath), never a PATH-resolved "bun": the runner can
+// be started with an explicit binary (CI matrix, ~/.bun/bin vs /usr/local),
+// and a bare "bun" would silently switch tools under every chunk. Under a
+// 1.3.x Bun on PATH that also hit INF-2: the missing `check` built-in recursed
+// into the package `check` script and died at exit 23. The version guard at
+// startup (see import.meta.main) keeps those children on a supported runtime.
+export function buildBunCommand(args: string[]): string[] {
+	return [process.execPath, ...args];
+}
+
 const projectToolTestCommand: TestCommand = {
 	label: ".omp/tests (project-local TUI debug tool)",
 	cwd: ".",
-	command: ["bun", "test", ...onlyFailuresArgs, "./.omp/tests/tui.test.ts"],
+	command: buildBunCommand(["test", ...onlyFailuresArgs, "./.omp/tests/tui.test.ts"]),
 	parallel: 1,
 };
 
@@ -207,12 +219,16 @@ function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
-function workspaceTestCommand(pkg: string, parallel: number, options: { extraArgs?: string[] } = {}): TestCommand {
+export function workspaceTestCommand(
+	pkg: string,
+	parallel: number,
+	options: { extraArgs?: string[] } = {},
+): TestCommand {
 	const { extraArgs = [] } = options;
 	return {
 		label: pkg,
 		cwd: pkg,
-		command: ["bun", "test", ...extraArgs],
+		command: buildBunCommand(["test", ...extraArgs]),
 		parallel,
 	};
 }
@@ -222,11 +238,11 @@ function workspaceTestCommand(pkg: string, parallel: number, options: { extraArg
 // run-rs-task.ts, which self-skips when the branch changed no Rust-affecting file
 // since its merge base with main, committed or not (printing a one-line notice),
 // and resolves the cargo/nextest invocation.
-function rustTestCommand(): TestCommand {
+export function rustTestCommand(): TestCommand {
 	return {
 		label: "rust (cargo nextest; skipped if no Rust changes)",
 		cwd: ".",
-		command: ["bun", "scripts/run-rs-task.ts", "test:rs"],
+		command: buildBunCommand(["scripts/run-rs-task.ts", "test:rs"]),
 	};
 }
 
@@ -323,7 +339,7 @@ async function codingAgentTestCommands(bucket: CodingAgentBucket): Promise<TestC
 		commands.push({
 			label: `packages/coding-agent (${plan.label}; ${testFiles.length} files; parallel=${plan.parallel}${chunkLabel}; ${chunk.length} files)`,
 			cwd: "packages/coding-agent",
-			command: ["bun", "test", ...onlyFailuresArgs, ...chunk],
+			command: buildBunCommand(["test", ...onlyFailuresArgs, ...chunk]),
 			parallel: plan.parallel,
 		});
 	}
@@ -404,50 +420,6 @@ function isScrubbedEnvVar(key: string): boolean {
 	}
 	// Any provider credential, e.g. ANTHROPIC_API_KEY / XAI_OAUTH_TOKEN / bedrock bearer.
 	return /_(API_KEY|OAUTH_TOKEN)$/.test(key) || key.includes("BEARER_TOKEN");
-}
-
-async function runTestCommand(testCommand: TestCommand): Promise<void> {
-	const cwd = path.join(repoRoot, testCommand.cwd);
-	const renderedCommand = testCommand.command.map(shellQuote).join(" ");
-	console.log(`\n==> ${testCommand.label}`);
-	console.log(`$ ${renderedCommand}`);
-
-	if (isDryRun) {
-		return;
-	}
-
-	const env = buildChildEnv();
-	for (let attempt = 1; ; attempt++) {
-		const proc = Bun.spawn(testCommand.command, {
-			cwd,
-			env,
-			stdout: "inherit",
-			stderr: "inherit",
-		});
-		// Watchdog, mirroring the parallel path: record that *we* killed the child,
-		// otherwise the resulting 137 is indistinguishable from an OOM kill.
-		let timedOut = false;
-		const killTimer = setTimeout(async () => {
-			timedOut = true;
-			try {
-				process.stdout.write(await describeStuckProcessTree(proc.pid));
-			} finally {
-				proc.kill("SIGKILL");
-			}
-		}, chunkTimeoutMs());
-		const exitCode = await proc.exited;
-		clearTimeout(killTimer);
-		if (exitCode === 0) {
-			return;
-		}
-		if (!timedOut && BUN_CRASH_EXITS[exitCode] && attempt < MAX_CHUNK_ATTEMPTS) {
-			console.log(
-				`==> ${testCommand.label}: bun crashed (exit ${exitCode}); retrying (attempt ${attempt + 1}/${MAX_CHUNK_ATTEMPTS})`,
-			);
-			continue;
-		}
-		throw new Error(`${testCommand.label} ${describeChunkFailure(exitCode, timedOut)}: ${renderedCommand}`);
-	}
 }
 
 // Child env shared by every spawned test process: the parent env with the
@@ -990,6 +962,60 @@ async function runTestCommandsInParallel(commands: TestCommand[], concurrency: n
 	}
 }
 
+// Outcome of one injected chunk execution for the sequential path. Mirrors
+// what the parallel path's `runAttempt` returns, so both paths build
+// `ChunkOutcome` identically.
+export interface SequentialRunResult {
+	exitCode: number;
+	output: string;
+}
+
+// Injected command execution for the sequential path, so the loop's failure
+// handling (run every chunk, collect failures, summarize, exit non-zero) is
+// testable without spawning real `bun test` children.
+export type SequentialChunkRunner = (testCommand: TestCommand) => Promise<SequentialRunResult>;
+
+// Run every command one at a time — the CI path, where each bucket is its own
+// memory-capped runner job. Like the parallel path, failures are collected and
+// reported together instead of failing fast, so one run surfaces every broken
+// chunk and exits non-zero without a runner stack trace. Chunk execution (and
+// its bun-crash retry policy, see MAX_CHUNK_ATTEMPTS) is injected; the real
+// runner passes runChunkSequentially.
+export async function runTestCommandsSequentially(commands: TestCommand[], run: SequentialChunkRunner): Promise<void> {
+	const failures: ChunkOutcome[] = [];
+	const runStartedAt = performance.now();
+	for (const testCommand of commands) {
+		const renderedCommand = testCommand.command.map(shellQuote).join(" ");
+		const startedAt = performance.now();
+		// The per-chunk header the sequential path has always printed, so CI
+		// logs show which chunk is running and its full argv.
+		process.stdout.write(`\n==> ${testCommand.label}\n$ ${renderedCommand}\n`);
+		const result = await run(testCommand);
+		const outcome: ChunkOutcome = {
+			label: testCommand.label,
+			command: renderedCommand,
+			exitCode: result.exitCode,
+			seconds: (performance.now() - startedAt) / 1000,
+			output: result.output,
+			retries: 0,
+		};
+		if (result.exitCode !== 0) {
+			failures.push(outcome);
+			process.stdout.write(`${formatChunkFailure(outcome, true)}\n`);
+		}
+	}
+	// `--dry-run` prints only the per-chunk headers/argv; no chunks ran, so
+	// there is nothing to summarize and nothing to fail.
+	if (isDryRun) {
+		return;
+	}
+	const totalSeconds = (performance.now() - runStartedAt) / 1000;
+	process.stdout.write(`${formatSummaryFooter(commands.length - failures.length, failures.length, totalSeconds)}\n`);
+	if (failures.length > 0) {
+		process.exitCode = 1;
+	}
+}
+
 // `OMP_TEST_SHARD=i/n` splits a mode's chunk commands across n CI jobs; job i
 // runs every chunk whose index ≡ i-1 (mod n). Round-robin rather than
 // contiguous ranges because the chunk list follows sorted file order, so slow
@@ -1011,26 +1037,78 @@ function selectShard<T>(commands: T[], spec: string | undefined): T[] {
 	return selected;
 }
 
-if (!(requestedMode in validModes)) {
-	throw new Error(`Unknown mode ${shellQuote(requestedMode)}. Expected one of: ${Object.keys(validModes).join(", ")}`);
+if (import.meta.main) {
+	// INF-2: one Bun for the whole run — refuse to start under an older Bun
+	// before any child chunk spawns under it.
+	requireBunVersion();
+	if (!(requestedMode in validModes)) {
+		throw new Error(
+			`Unknown mode ${shellQuote(requestedMode)}. Expected one of: ${Object.keys(validModes).join(", ")}`,
+		);
+	}
+
+	const requestedCommands = selectShard(await commandsForMode(requestedMode as Mode), Bun.env.OMP_TEST_SHARD);
+	const explicitConcurrency = Boolean(Bun.env.OMP_TEST_CONCURRENCY?.trim());
+	// CI defaults to one process at a time, but memory-sized workflow buckets
+	// explicitly opt into bounded process concurrency. Local runs fan out by
+	// default and may use the same override. Resolved before the dry-run check so
+	// `--dry-run` prints the argv the real run would use, budget included.
+	const pooled = requestedCommands.length > 1 && (!isCI() || explicitConcurrency);
+	// The sequential path is a pool of one, so a lone chunk keeps the whole budget.
+	const poolWidth = pooled
+		? testConcurrency(requestedCommands.length, Bun.env.OMP_TEST_CONCURRENCY, os.availableParallelism())
+		: 1;
+	const testCommands = applyChunkBudget(requestedCommands, poolWidth);
+	if (pooled && !isDryRun) {
+		await runTestCommandsInParallel(testCommands, poolWidth);
+	} else {
+		// Sequential (CI) runs never fail fast: every chunk runs, failures are
+		// collected and summarized, and the process exits non-zero.
+		await runTestCommandsSequentially(testCommands, runChunkSequentially);
+	}
 }
 
-const requestedCommands = selectShard(await commandsForMode(requestedMode as Mode), Bun.env.OMP_TEST_SHARD);
-const explicitConcurrency = Boolean(Bun.env.OMP_TEST_CONCURRENCY?.trim());
-// CI defaults to one process at a time, but memory-sized workflow buckets
-// explicitly opt into bounded process concurrency. Local runs fan out by
-// default and may use the same override. Resolved before the dry-run check so
-// `--dry-run` prints the argv the real run would use, budget included.
-const pooled = requestedCommands.length > 1 && (!isCI() || explicitConcurrency);
-// The sequential path is a pool of one, so a lone chunk keeps the whole budget.
-const poolWidth = pooled
-	? testConcurrency(requestedCommands.length, Bun.env.OMP_TEST_CONCURRENCY, os.availableParallelism())
-	: 1;
-const testCommands = applyChunkBudget(requestedCommands, poolWidth);
-if (pooled && !isDryRun) {
-	await runTestCommandsInParallel(testCommands, poolWidth);
-} else {
-	for (const testCommand of testCommands) {
-		await runTestCommand(testCommand);
+// Real chunk execution for the sequential path: spawn the child with
+// inherited stdio (the sequential path always streamed chunks inline),
+// watchdog-kill it if it wedges, retry bun-crash exits in a fresh process
+// (MAX_CHUNK_ATTEMPTS), and return the outcome. `output` carries the failure
+// reason in words (describeChunkFailure) since the child's own output streamed
+// to the console rather than being captured.
+async function runChunkSequentially(testCommand: TestCommand): Promise<SequentialRunResult> {
+	if (isDryRun) {
+		return { exitCode: 0, output: "" };
+	}
+	const cwd = path.join(repoRoot, testCommand.cwd);
+	const env = buildChildEnv();
+	for (let attempt = 1; ; attempt++) {
+		const proc = Bun.spawn(testCommand.command, {
+			cwd,
+			env,
+			stdout: "inherit",
+			stderr: "inherit",
+		});
+		// Watchdog, mirroring the parallel path: record that *we* killed the child,
+		// otherwise the resulting 137 is indistinguishable from an OOM kill.
+		let timedOut = false;
+		const killTimer = setTimeout(async () => {
+			timedOut = true;
+			try {
+				process.stdout.write(await describeStuckProcessTree(proc.pid));
+			} finally {
+				proc.kill("SIGKILL");
+			}
+		}, chunkTimeoutMs());
+		const exitCode = await proc.exited;
+		clearTimeout(killTimer);
+		if (exitCode === 0) {
+			return { exitCode: 0, output: "" };
+		}
+		if (!timedOut && BUN_CRASH_EXITS[exitCode] && attempt < MAX_CHUNK_ATTEMPTS) {
+			console.log(
+				`==> ${testCommand.label}: bun crashed (exit ${exitCode}); retrying (attempt ${attempt + 1}/${MAX_CHUNK_ATTEMPTS})`,
+			);
+			continue;
+		}
+		return { exitCode, output: `${describeChunkFailure(exitCode, timedOut)}\n` };
 	}
 }

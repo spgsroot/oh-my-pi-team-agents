@@ -36,6 +36,7 @@ export type AgentRegistryProtocol = {
 	setHistory: RpcMethod<[id: string, history: AgentHistorySummary, expectedSessionFile?: string], boolean>;
 	setStatus: RpcMethod<[id: string, status: AgentStatus, expected?: AgentRefExpectation], boolean>;
 	markResultAccepted: RpcMethod<[id: string, expected?: AgentRefExpectation, responseAt?: number], boolean>;
+	markTurnSettled: RpcMethod<[id: string, expected?: AgentRefExpectation, summary?: string], boolean>;
 	staleAcceptedRuns: RpcMethod<[], AgentRef[]>;
 	setActivity: RpcMethod<[id: string, activity: string], void>;
 	attachSession: RpcMethod<
@@ -63,6 +64,7 @@ export type AgentLifecycleProtocol = {
 	reclaimDeadCorpse: RpcMethod<[id: string, expected: AgentRef], boolean>;
 	manages: RpcMethod<[registry: AgentRegistryApi], boolean>;
 	isParking: RpcMethod<[id: string, expected?: AgentRefExpectation], boolean>;
+	canRevive: RpcMethod<[ref: AgentRef], boolean>;
 	park: RpcMethod<[id: string], void>;
 	ensureLive: RpcMethod<[id: string], AgentSessionHandle>;
 	release: RpcMethod<[id: string, expected?: AgentRefExpectation, options?: { tombstone?: boolean }], boolean>;
@@ -90,7 +92,7 @@ export type IrcBusProtocol = {
 		],
 		IrcMessage | null
 	>;
-	take: RpcMethod<[agentId: string, from?: string], IrcMessage | undefined>;
+	take: RpcMethod<[agentId: string, from?: string, filter?: IrcWaitFilter], IrcMessage | undefined>;
 	unreadCount: RpcMethod<[agentId: string], number>;
 	recordReply: RpcMethod<[from: string, to: string], void>;
 };

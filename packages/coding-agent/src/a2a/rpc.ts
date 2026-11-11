@@ -14,12 +14,14 @@
  */
 
 import type { SpawnSubagentOptions } from "../extensibility/extensions/types";
-import type { OutgoingRequestsApi } from "./outgoing-requests";
 import { MAIN_AGENT_ID, type AgentRef, type AgentRegistryApi } from "../registry/agent-registry";
 import { PerCallModelError } from "../task/model-approval";
 import { SpawnRefusedError } from "../task/spawn-run";
 import { SpawnPendingError } from "../task/spawn-subagent";
 import { StructuredSubagentError } from "../task/structured-subagent";
+import { truncateCodePoints } from "../utils/code-points";
+import type { IncomingRequestsApi } from "./incoming-requests";
+import type { OutgoingRequestsApi } from "./outgoing-requests";
 import type { IrcDeliveryReceipt, IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import { logger } from "@oh-my-pi/pi-utils";
 
@@ -224,7 +226,7 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 		: undefined;
 }
 
-/** Largest published output inlined as a task artifact; the rest is a client-side read concern. */
+/** Largest published output inlined as a task artifact, in Unicode code points; the rest is a client-side read concern. */
 export const A2A_ARTIFACT_MAX_CHARS = 100_000;
 
 /**
@@ -252,7 +254,7 @@ export async function attachOutputArtifact(
 			{
 				artifactId: `${task.id}:output`,
 				name: "output",
-				parts: [{ text: text.slice(0, A2A_ARTIFACT_MAX_CHARS) }],
+				parts: [{ text: truncateCodePoints(text, A2A_ARTIFACT_MAX_CHARS) }],
 			},
 		],
 	};
@@ -462,8 +464,13 @@ export interface A2aDispatchDeps {
 	createdTaskRefs?: Map<string, AgentRef | undefined>;
 	/** Client contextId persisted per spawned task, for ListTasks filtering. */
 	contextIds?: Map<string, string>;
-	/** Notified when a peer request with a reply identity is delivered here. */
-	noteIncomingRequest?: (request: A2aIncomingRequest) => void;
+	/**
+	 * Incoming-request ledger. A request with a reply identity is recorded
+	 * here before delivery and rolled back by exact match when the delivery is
+	 * refused. Absent only for dispatch callers that do no reply tracking;
+	 * the live server always passes the process-wide instance.
+	 */
+	incoming?: IncomingRequestsApi;
 	/**
 	 * Pending spawns created by this bridge. Absent only for callers that never
 	 * spawn; the live server always installs one ledger for every view.
@@ -471,12 +478,26 @@ export interface A2aDispatchDeps {
 	pendingSpawns?: PendingSpawnLedger;
 	/** Process-wide outgoing reply registry. Absent leaves a correlated reply on IRC. */
 	outgoing?: OutgoingRequestsApi;
+	/**
+	 * Proves a `parked` recipient can actually be revived by the agent
+	 * lifecycle (A2A-1). Absent treats a parked ref as addressable: callers
+	 * without a lifecycle keep the pre-A2A-1 bus behavior (the bus's own
+	 * ensureLive gate still refuses an impossible revive).
+	 */
+	canRevive?: (ref: AgentRef) => boolean;
 }
 
 /** A delivered peer request that expects an answer (A2). */
 export interface A2aIncomingRequest {
 	/** Sender's public A2A identity: its `a2a:<from>` agent carries the reply. */
 	from: string;
+	/**
+	 * The sender's bridge URL as it arrived on the wire (`metadata.fromUrl`).
+	 * Retained so an automatic reply can pin the originating endpoint when
+	 * several registrations share `from` as their skill id; never used to
+	 * construct a destination — only registered peers are ever sent to.
+	 */
+	fromUrl?: string;
 	/** The request's A2A `messageId`, echoed back as `inReplyTo`. */
 	messageId: string;
 	/** Local agent id the request was delivered to. */
@@ -487,10 +508,39 @@ export interface A2aIncomingRequest {
 
 export const A2A_SENDER_ID = "a2a";
 
+/** Which reachable group an agent belongs to for A2A delivery and card order. */
+export type A2aReachableGroup = "main" | "running" | "idle" | "parked";
+
+/**
+ * The narrow shared reachability predicate behind the served card and
+ * addressed delivery (A2A-1): Main is always addressable by identity, a
+ * `running` subagent receives asides, an `idle` subagent is woken by the
+ * IRC bus, and a `parked` subagent goes through the lifecycle revive path.
+ * Advisors and aborted tombstones are unreachable — `undefined`. The bus
+ * stays the delivery authority for everything else: an idle ref whose
+ * session is gone fails there with the existing `failed` receipt.
+ */
+export function a2aReachableGroup(ref: AgentRef): A2aReachableGroup | undefined {
+	if (ref.kind === "advisor") return undefined;
+	if (ref.kind === "main") return ref.status === "aborted" ? undefined : "main";
+	switch (ref.status) {
+		case "running":
+			return "running";
+		case "idle":
+			return "idle";
+		case "parked":
+			return "parked";
+		case "aborted":
+			return undefined;
+	}
+}
+
 /**
  * Resolve an omp address: an exact agent id, or the `main` alias. Advisor
  * transcripts are not peers — the agent card and ListTasks already hide them,
- * so GetTask/CancelTask must not reach them either.
+ * so GetTask/CancelTask must not reach them either. Deliverability is a
+ * separate A2A-1 gate (see {@link sendA2aMessage}); every registered
+ * non-advisor ref stays visible to task views.
  */
 export function resolveAddressedRef(
 	registry: Pick<AgentRegistryApi, "get">,
@@ -509,6 +559,32 @@ export function resolveAddressedRef(
 		(lowered === "main" ? registry.get(MAIN_AGENT_ID) : undefined) ??
 		registry.get(to.slice(0, 1).toUpperCase() + to.slice(1));
 	return ref?.kind === "advisor" ? undefined : ref;
+}
+
+/**
+ * Resolve an omp address to a ref A2A delivery can deliver to (A2A-1): the
+ * normal address resolution gated by {@link a2aReachableGroup} and, for
+ * `parked` refs, the lifecycle's proven revive capability. Advisors, aborted
+ * tombstones and unrevivable parked refs resolve to `undefined` and are
+ * refused like an unknown agent (`TASK_NOT_FOUND`, HTTP 404), as is a ref
+ * removed between discovery and delivery. A still-registered idle corpse
+ * (no live session) resolves normally: it is a legitimate lookup whose
+ * delivery the IRC bus then refuses, surfacing as the existing
+ * `DELIVERY_FAILED` error (HTTP 200) — never a 404 and never a fresh
+ * replacement spawn.
+ */
+export function resolveDeliverableRef(
+	registry: Pick<AgentRegistryApi, "get">,
+	to: string,
+	identityName?: string,
+	canRevive?: (ref: AgentRef) => boolean,
+): AgentRef | undefined {
+	const ref = resolveAddressedRef(registry, to, identityName);
+	if (ref === undefined || a2aReachableGroup(ref) === undefined) return undefined;
+	// A parked ref needs a proven revive path; an impossible revive is the
+	// unknown-agent failure the caller already reports.
+	if (ref.status === "parked" && canRevive !== undefined && !canRevive(ref)) return undefined;
+	return ref;
 }
 
 /** Whether a spawn failure is a pre-spawn refusal the client can act on. */
@@ -601,8 +677,36 @@ async function abortOwnedRef(deps: A2aDispatchDeps, ref: AgentRef): Promise<void
 		deps.registry.setStatus(ref.id, "aborted", ref);
 	}
 }
+/**
+ * The removal transition shared by the registry `removed` event and a
+ * registration that settles to a ref the registry no longer holds: drop the
+ * pending row — only while it is still this exact ledger record — with its
+ * ownership and context state, then notify the views that served it. A
+ * replacement ref under the same id is never mutated, and a normal removal
+ * stays missing: no new rejected/FAILED tombstone is minted.
+ */
+export function discardPendingSpawn(deps: A2aDispatchDeps, record: PendingSpawnRecord): void {
+	const ledger = deps.pendingSpawns;
+	// An obsolete callback must not discard a newer ledger record for the id.
+	if (ledger?.get(record.task.id) !== record) return;
+	ledger.delete(record.task.id);
+	deps.createdTaskRefs?.delete(record.task.id);
+	deps.createdTaskIds?.delete(record.task.id);
+	deps.contextIds?.delete(record.task.id);
+	ledger.notify(record.task.id);
+}
 
 async function onRegistrationResolved(deps: A2aDispatchDeps, record: PendingSpawnRecord, ref: AgentRef): Promise<void> {
+	// The ref may have registered and been removed — or been replaced under
+	// the id — before this callback ran. The exact-ref check gates every
+	// mutation below: resolving the row into a ref the registry no longer
+	// holds would resurrect a removed agent through GetTask/ListTasks/SSE and
+	// let a pending cancel abort a generation the registry already dropped.
+	// A mismatch is the same transition as the registry's `removed` event.
+	if (deps.registry.get(ref.id) !== ref) {
+		discardPendingSpawn(deps, record);
+		return;
+	}
 	record.outcome = "resolved";
 	record.ref = ref;
 	claimResolvedRef(deps, ref);
@@ -705,7 +809,7 @@ export async function sendA2aMessage(params: unknown, deps: A2aDispatchDeps): Pr
 	const contextBlock =
 		request.context !== undefined ? `[Shared context from the requesting terminal]\n${request.context}` : undefined;
 	if (request.to !== undefined && request.spawn !== true) {
-		const target = resolveAddressedRef(deps.registry, request.to, deps.identityName);
+		const target = resolveDeliverableRef(deps.registry, request.to, deps.identityName, deps.canRevive);
 		if (!target) {
 			throw new RpcError(RPC_ERRORS.TASK_NOT_FOUND, `Task not found: ${request.to}`, { httpStatus: 404 });
 		}
@@ -742,25 +846,64 @@ export async function sendA2aMessage(params: unknown, deps: A2aDispatchDeps): Pr
 		sections.push(request.text);
 		const body = sections.join("\n\n");
 		const deliveredAt = Date.now();
-		const receipt = await deps.send({
-			from: deps.senderId ?? A2A_SENDER_ID,
-			to: target.id,
-			body,
-			external: true,
-			...(request.inReplyTo !== undefined
-				? { a2aInReplyTo: request.inReplyTo }
-				: { a2aMessageId: request.messageId }),
-		});
-		if (receipt.outcome !== "failed" && request.from !== undefined && request.inReplyTo === undefined) {
-			deps.noteIncomingRequest?.({
-				from: request.from,
-				messageId: request.messageId,
-				to: target.id,
-				at: deliveredAt,
-			});
+		// A request with a reply identity is recorded BEFORE the delivery: a
+		// fast recipient wakes synchronously inside the bus send and may claim
+		// (or even answer) it before this function sees the receipt, so the
+		// record must already exist. A correlated reply records nothing.
+		const from = request.from;
+		const trackIncoming = from !== undefined && request.inReplyTo === undefined;
+		const incomingRecord = trackIncoming
+			? {
+					from,
+					messageId: request.messageId,
+					to: target.id,
+					at: deliveredAt,
+					...(request.fromUrl !== undefined ? { fromUrl: request.fromUrl } : {}),
+				}
+			: undefined;
+		if (incomingRecord !== undefined) {
+			try {
+				await deps.incoming?.note(incomingRecord);
+			} catch (error) {
+				// The bookkeeping failed: never deliver a request whose reply
+				// tracking is lost, or the sender would wait forever.
+				const reason = error instanceof Error ? error.message : String(error);
+				throw new RpcError(RPC_ERRORS.INTERNAL_ERROR, `Failed to record incoming request: ${reason}`);
+			}
 		}
+		let receipt: IrcDeliveryReceipt;
+		try {
+			receipt = await deps.send({
+				from: deps.senderId ?? A2A_SENDER_ID,
+				to: target.id,
+				body,
+				external: true,
+				...(request.inReplyTo !== undefined
+					? { a2aInReplyTo: request.inReplyTo }
+					: { a2aMessageId: request.messageId }),
+			});
+		} catch (error) {
+			// A fast recipient may already hold a claim on this request; the
+			// exact-record discard invalidates it without touching others.
+			if (incomingRecord !== undefined) await deps.incoming?.discard(incomingRecord);
+			throw error;
+		}
+		if (receipt.outcome === "failed" && incomingRecord !== undefined) {
+			// Refused delivery: the addressed agent never saw the request, so
+			// its record and any lease a fast claimant took on it must go.
+			await deps.incoming?.discard(incomingRecord);
+		}
+		// A woken/revived delivery started a new turn (A2A-1): the response
+		// task must report WORKING, never a completed prior turn's terminal
+		// state. GetTask keeps reading the live ref, so the task terminalizes
+		// when the wake turn actually settles.
 		const current = deps.registry.get(target.id) ?? target;
-		return persistTask(taskFor(current, deps, { delivery: receipt, requestedTo: request.to }), request, deps, false);
+		const task = taskFor(current, deps, { delivery: receipt, requestedTo: request.to });
+		const delivered =
+			receipt.outcome === "woken" || receipt.outcome === "revived"
+				? { ...task, status: { state: TASK_STATE.WORKING, timestamp: task.status.timestamp } }
+				: task;
+		return persistTask(delivered, request, deps, false);
 	}
 	if (!deps.spawn) {
 		throw new RpcError(RPC_ERRORS.INTERNAL_ERROR, "spawnSubagent is not available in this host");

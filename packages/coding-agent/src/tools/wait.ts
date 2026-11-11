@@ -59,13 +59,24 @@ interface WaitMessaging {
  * wait: broadcasts and ordinary progress alone stay queued and inject as
  * asides once the wait returns; direct team notices can end it. Mailbox mail
  * (a failed live hand-off) reaches the caller only here, so it is always taken.
+ *
+ * `teamNotices: false` (a wait on the caller's own jobs or service) leaves a
+ * queued notice in place instead: it is informational, so it injects once the
+ * wait returns rather than standing in for the work the caller waits on.
  */
-function takeQueuedMessages(messaging: WaitMessaging, woke?: IrcMessage): IrcMessage[] {
+function takeQueuedMessages(
+	messaging: WaitMessaging,
+	options?: { woke?: IrcMessage; teamNotices?: boolean },
+): IrcMessage[] {
 	const { registry, senderId } = messaging;
 	const bus = IrcBus.global();
-	const queued = woke ? [woke] : [];
-	for (let msg = bus.take(senderId); msg; msg = bus.take(senderId)) queued.push(msg);
-	const wakes = queued.length > 0 ? undefined : (msg: IrcMessage) => ircWaitAccepts({ directOnly: true }, msg);
+	const teamNotices = options?.teamNotices !== false;
+	const mailboxFilter = teamNotices ? undefined : { teamNotices: false };
+	const queued = options?.woke ? [options.woke] : [];
+	for (let msg = bus.take(senderId, undefined, mailboxFilter); msg; msg = bus.take(senderId, undefined, mailboxFilter))
+		queued.push(msg);
+	const wakes =
+		queued.length > 0 ? undefined : (msg: IrcMessage) => ircWaitAccepts({ directOnly: true, teamNotices }, msg);
 	queued.push(...drainPendingInbox(registry, senderId, wakes));
 	// Bus ids are snowflakes: they order messages sent within one millisecond.
 	return queued.sort((a, b) => a.ts - b.ts || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
@@ -135,12 +146,15 @@ export function hasWaitTool(session: ToolSession): boolean {
  * still answer soon: each one finished its turn, is blocked on the caller
  * itself (the cycle that would park both sides), or is waiting on the user.
  * With nothing new, a wait returns after a window from {@link WAIT_LADDER_MS}
- * that climbs across back-to-back idle waits. A direct message or team notice
- * arriving mid-wait ends any wait, returning every message queued by then.
- * Broadcasts and ordinary progress ask the caller nothing, so they never end a
- * wait and inject as asides once it returns; the exception is a broadcast from
- * an agent a reply wait asked (see `IrcBus.unansweredSends`). Ordinary progress
- * leaves its sender's reply owed; a team notice can settle it without a reply.
+ * that climbs across back-to-back idle waits. A direct message arriving
+ * mid-wait ends any wait, returning every message queued by then. Broadcasts,
+ * ordinary progress and team notices ask the caller nothing, so they never end
+ * a wait on its own jobs or services and inject as asides once it returns; the
+ * exception is a broadcast from an agent a reply wait asked (see
+ * `IrcBus.unansweredSends`). A team notice does end a reply wait — it is a
+ * non-request answer, e.g. plan approval — but it answers nothing in the
+ * accounting: ordinary progress and notices both leave their sender's reply
+ * owed.
  */
 export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetails> {
 	readonly name = "wait";
@@ -171,9 +185,16 @@ export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetail
 		const senderId = this.session.getAgentId?.() ?? undefined;
 		const messaging = registry && senderId ? { registry, senderId } : undefined;
 		const manager = this.session.asyncJobManager;
+		// Jobs are in-process, so this is exact before any await. A wait on the
+		// caller's own work refuses a queued team notice at entry and mid-wait:
+		// the notice is informational and injects once the wait returns instead
+		// of standing in for the job or service it was called for.
+		const jobs = manager?.getRunningJobs({ ownerId: senderId }) ?? [];
 
 		if (messaging) {
-			const queued = takeQueuedMessages(messaging);
+			const queued = takeQueuedMessages(messaging, {
+				teamNotices: jobs.length === 0 && !hasLiveOwnedService(this.session),
+			});
 			if (queued.length > 0) return messageResult(messaging.senderId, queued);
 		}
 		// Refreshes owned-service tracking only; jobs are in-process, so a hung
@@ -188,11 +209,14 @@ export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetail
 				if (signal?.reason !== TOOL_INTERRUPT_ABORT_REASON) throw error;
 			}
 			if (messaging) {
-				const queued = takeQueuedMessages(messaging);
+				// Re-read after the refresh: it is what first tracks a service a
+				// resumed session inherited.
+				const queued = takeQueuedMessages(messaging, {
+					teamNotices: jobs.length === 0 && !hasLiveOwnedService(this.session),
+				});
 				if (queued.length > 0) return messageResult(messaging.senderId, queued);
 			}
 		}
-		const jobs = manager?.getRunningJobs({ ownerId: senderId }) ?? [];
 		// An accepted completion whose delivery has not reached the transcript
 		// yet (queued, parked on the yield queue, or skipped while an earlier
 		// wait watched it) is exactly what this wait is for: return it now.
@@ -220,7 +244,9 @@ export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetail
 	}
 
 	/**
-	 * Block until an owned job settles, an owned service finishes, a direct message or team notice arrives, the ladder window elapses, or the call aborts.
+	 * Block until an owned job settles, an owned service finishes, a direct message
+	 * (or, with no jobs and no service, a team notice) arrives, the ladder window
+	 * elapses, or the call aborts.
 	 * With neither jobs nor a service, the block is a reply wait: it also ends once no agent asked can still reply.
 	 */
 	async #blockUntilWake(args: {
@@ -245,7 +271,15 @@ export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetail
 		// Only `busAbort` can reject this leg, and it fires once the wait has settled.
 		const busLeg = messaging
 			? IrcBus.global()
-					.wait(messaging.senderId, { directOnly: true, repliesFrom: asked }, 0, busAbort.signal)
+					// A wait on the caller's own jobs or service is not its answer
+					// inbox: a team notice stays queued and injects as an aside after
+					// the wait instead of cutting it short. A pure reply wait takes one.
+					.wait(
+						messaging.senderId,
+						{ directOnly: true, repliesFrom: asked, teamNotices: replyWait },
+						0,
+						busAbort.signal,
+					)
 					.catch(() => null)
 			: undefined;
 		// A reply wait re-checks whether an agent asked can still answer on
@@ -336,16 +370,18 @@ export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetail
 			// A dequeued message wins a photo-finish with a job: the job remains
 			// deliverable, whereas a lost message cannot be recovered from the bus.
 			const message = await busLeg;
-			if (message && messaging) return messageResult(messaging.senderId, takeQueuedMessages(messaging, message));
+			if (message && messaging)
+				return messageResult(messaging.senderId, takeQueuedMessages(messaging, { woke: message }));
 			if (signal?.aborted) {
 				// Steering, a peer IRC, or a completion notice cut the wait short:
 				// the designed wake path, so the message injects after a normal
 				// result. Any other abort stops the run.
 				if (signal.reason === TOOL_INTERRUPT_ABORT_REASON) {
 					// A direct message queued in the session inbox (it missed the
-					// bus waiter) is returned here rather than injected after.
+					// bus waiter) is returned here rather than injected after. A team
+					// notice never aborts a wait, so notices stay refused here too.
 					if (messaging) {
-						const queued = takeQueuedMessages(messaging);
+						const queued = takeQueuedMessages(messaging, { teamNotices: false });
 						if (queued.length > 0) return messageResult(messaging.senderId, queued);
 					}
 					// Not `useless`: a message woke the agent, which the loop guard

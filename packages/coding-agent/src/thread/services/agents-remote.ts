@@ -121,6 +121,10 @@ export class RemoteAgentRegistry implements AgentRegistryApi {
 		return this.#remote.callSync("markResultAccepted", id, expected, responseAt);
 	}
 
+	markTurnSettled(id: string, expected?: AgentRefExpectation, summary?: string): boolean {
+		return this.#remote.callSync("markTurnSettled", id, expected, summary);
+	}
+
 	staleAcceptedRuns(): AgentRef[] {
 		return this.#remote.callSync("staleAcceptedRuns");
 	}
@@ -207,6 +211,10 @@ export class RemoteAgentLifecycle implements AgentLifecycleApi {
 		return this.#remote.callSync("isParking", id, expected);
 	}
 
+	canRevive(ref: AgentRef): boolean {
+		return this.#remote.callSync("canRevive", ref);
+	}
+
 	park(id: string): Promise<void> {
 		return this.#remote.call("park", id);
 	}
@@ -254,8 +262,8 @@ export class RemoteIrcBus implements IrcBusApi {
 		return this.#remote.call("wait", agentId, filter, timeoutMs, signal, options);
 	}
 
-	take(agentId: string, from?: string): IrcMessage | undefined {
-		return this.#remote.callSync("take", agentId, from);
+	take(agentId: string, from?: string, filter?: IrcWaitFilter): IrcMessage | undefined {
+		return this.#remote.callSync("take", agentId, from, filter);
 	}
 
 	unreadCount(agentId: string): number {

@@ -27,7 +27,7 @@ import {
 	type SpawnA2aAgentResult,
 	spawnA2aAgent,
 } from "./agent-bridge";
-import { IncomingRequests } from "./incoming-requests";
+import { IncomingRequests, type IncomingRequestLease } from "./incoming-requests";
 import type { A2aIncomingRequest } from "./rpc";
 
 export interface A2aReplyRelayOptions {
@@ -44,42 +44,99 @@ export interface A2aReplyRelayOptions {
 	send?: (options: SpawnA2aAgentOptions) => Promise<SpawnA2aAgentResult>;
 }
 
+/** Control handle for an installed relay. */
+export interface A2aReplyRelayHandle {
+	/** Detach the relay from the session's event stream. */
+	stop(): void;
+	/**
+	 * Wait for the relay's queued run decisions and the detached sends they
+	 * started, including work enqueued while draining. Test/control seam only:
+	 * production turn finalization never awaits it, so a slow or stuck
+	 * transport never blocks a run's settle.
+	 */
+	settled(): Promise<void>;
+}
+
 export interface SendA2aReplyOptions extends Pick<
 	A2aReplyRelayOptions,
 	"bridge" | "identity" | "rescan" | "timeoutMs" | "send"
 > {
-	request: A2aIncomingRequest;
+	/** The claim on the request being answered; settled by this send. */
+	lease: IncomingRequestLease;
 	answer: string;
 }
 
-/** Install the relay on a main session; returns the unsubscribe. */
-export function installA2aReplyRelay(options: A2aReplyRelayOptions): () => void {
+/** Detached `sendA2aReply` operations in this thread, drained by {@link settleA2aReplies}. */
+const detachedSends = new Set<Promise<unknown>>();
+
+/**
+ * Wait until every detached A2A reply send started in this thread has
+ * finished, including work enqueued while draining. A test and control seam:
+ * production code never awaits it, so reply transport stays fully detached
+ * from turn finalization.
+ */
+export async function settleA2aReplies(): Promise<void> {
+	while (detachedSends.size > 0) {
+		await Promise.allSettled(detachedSends);
+	}
+}
+
+/** Install the relay on a main session; returns the control handle. */
+export function installA2aReplyRelay(options: A2aReplyRelayOptions): A2aReplyRelayHandle {
 	// Requests whose relay chance was used up, kept open for a manual reply.
-	const settled = new Set<string>();
-	let pending = Promise.resolve();
-	return options.subscribe(event => {
+	const settledRequests = new Set<string>();
+	let queue = Promise.resolve();
+	let queued = 0;
+	let stopped = false;
+	const unsubscribe = options.subscribe(event => {
 		if (event.type !== "agent_end" || event.isTerminal === false) return;
-		pending = pending
+		queued++;
+		queue = queue
 			.then(async () => {
 				for (const request of await IncomingRequests.global().list(MAIN_AGENT_ID)) {
-					if (settled.has(request.messageId)) continue;
+					if (settledRequests.has(request.messageId)) continue;
 					const answer = answerAfter(event.messages, request.at);
 					if (answer === undefined) {
-						settled.add(request.messageId);
+						settledRequests.add(request.messageId);
 						continue;
 					}
-					const consumed = await IncomingRequests.global().consume({
+					const lease = await IncomingRequests.global().consume({
 						to: MAIN_AGENT_ID,
 						from: request.from,
 						messageId: request.messageId,
 					});
-					if (consumed !== undefined) void sendA2aReply({ ...options, request: consumed, answer });
+					if (lease !== undefined) {
+						// This attempt used the request's one automatic-turn
+						// opportunity, even when the send fails and releases it:
+						// a later human turn is not a retry.
+						settledRequests.add(request.messageId);
+						void sendA2aReply({ ...options, lease, answer });
+					}
 				}
 			})
 			.catch(error => {
 				logger.warn("A2A reply relay failed", { error: String(error) });
+			})
+			.finally(() => {
+				queued--;
 			});
 	});
+	return {
+		stop() {
+			if (stopped) return;
+			stopped = true;
+			unsubscribe();
+		},
+		async settled() {
+			// Drain the decision queue first (a queued decision may still start
+			// a send), then the detached sends — rechecking until both stay
+			// quiet, so work enqueued while draining is also awaited.
+			while (queued > 0 || detachedSends.size > 0) {
+				await queue;
+				await settleA2aReplies();
+			}
+		},
+	};
 }
 
 /**
@@ -102,35 +159,140 @@ function answerAfter(messages: readonly AgentMessage[], at: number): string | un
 	return ended === "aborted" || ended === "error" ? undefined : answer;
 }
 
-function findPeer(bridge: A2aBridgeApi, from: string): A2aRuntimeAgent | undefined {
-	return bridge.list().find(agent => agent.skillId === from);
+/**
+ * Normalize a URL for endpoint comparison. An invalid URL is returned as-is:
+ * it can never equal a valid registered endpoint, and the refusal path (not a
+ * fallback) is the correct outcome for it.
+ */
+function normalizedUrl(url: string): string {
+	try {
+		return new URL(url).toString();
+	} catch {
+		return url;
+	}
 }
 
-/** Send a correlated reply to the peer that originated a request. */
-export async function sendA2aReply(options: SendA2aReplyOptions): Promise<void> {
-	const { request, answer } = options;
-	try {
-		let peer = findPeer(options.bridge, request.from);
-		if (peer === undefined) {
-			await options.rescan();
-			peer = findPeer(options.bridge, request.from);
-		}
-		if (peer === undefined) {
-			logger.warn("A2A reply relay: sender is not a reachable peer", { from: request.from });
-			return;
-		}
-		const send = options.send ?? spawnA2aAgent;
-		const result = await send({
-			agent: peer,
-			prompt: answer,
-			inReplyTo: request.messageId,
-			fromIdentity: await options.identity(),
-			...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
-		});
-		if (result.exitCode !== 0) {
-			logger.warn("A2A reply relay failed", { from: request.from, error: result.error ?? result.output });
-		}
-	} catch (error) {
-		logger.warn("A2A reply relay failed", { from: request.from, error: String(error) });
+/**
+ * The one peer registration the request's sender resolves to.
+ *
+ * Candidates are registered agents whose `skillId` equals `request.from`. A
+ * supplied `fromUrl` must match a candidate's registered endpoint URL by
+ * normal URL serialization (including a trailing `/`); a mismatch never falls
+ * back to another candidate. With no URL, exactly one candidate must exist —
+ * two or more make the selection ambiguous and it is refused instead of
+ * arbitrary. Duplicate registrations of the same `(url, skillId)` endpoint
+ * collapse to one candidate (the bridge keeps one entry per endpoint).
+ */
+function findPeer(bridge: A2aBridgeApi, request: A2aIncomingRequest): A2aRuntimeAgent | undefined {
+	let candidates = bridge.list().filter(agent => agent.skillId === request.from);
+	if (request.fromUrl !== undefined) {
+		const wanted = normalizedUrl(request.fromUrl);
+		candidates = candidates.filter(agent => normalizedUrl(agent.url) === wanted);
 	}
+	const distinct = new Map<string, A2aRuntimeAgent>();
+	for (const candidate of candidates) {
+		const key = `${normalizedUrl(candidate.url)}\u0000${candidate.skillId}`;
+		// Duplicate registrations of the same endpoint+skill advertise one
+		// destination; the first registration is kept deterministically so
+		// duplicates can never make the selection arbitrary.
+		if (!distinct.has(key)) distinct.set(key, candidate);
+	}
+	if (distinct.size !== 1) return undefined;
+	return distinct.values().next().value;
+}
+
+/**
+ * One structured warning for a sender the roster cannot resolve to exactly
+ * one endpoint: never the reply text, never credentials. Ambiguity (several
+ * candidates, no `fromUrl` to separate them) and an unmatched `fromUrl` are
+ * both named, with every candidate's registered name and URL.
+ */
+function logUnresolvedSender(bridge: A2aBridgeApi, request: A2aIncomingRequest): void {
+	const candidates = bridge
+		.list()
+		.filter(agent => agent.skillId === request.from)
+		.map(agent => ({ name: agent.name, url: agent.url }));
+	if (request.fromUrl !== undefined) {
+		if (candidates.length > 0) {
+			logger.warn("A2A reply relay: sender endpoint does not match any registered peer", {
+				from: request.from,
+				fromUrl: request.fromUrl,
+				candidates,
+			});
+		} else {
+			logger.warn("A2A reply relay: sender is not a reachable peer", { from: request.from });
+		}
+		return;
+	}
+	if (candidates.length > 1) {
+		logger.warn("A2A reply relay: ambiguous automatic reply destination, kept open for a manual reply", {
+			from: request.from,
+			candidates,
+		});
+		return;
+	}
+	logger.warn("A2A reply relay: sender is not a reachable peer", { from: request.from });
+}
+
+/**
+ * Send a correlated reply to the peer that originated the leased request. The
+ * send is registered in the thread's detached-send set the moment it starts,
+ * so {@link settleA2aReplies} can wait for it without the callers awaiting.
+ *
+ * The lease settles with the send: `exitCode === 0` confirms it (the request
+ * is permanently answered); any failure — no reachable peer, a nonzero exit,
+ * or a throw — releases it, so the request stays open for a manual reply.
+ * Returns whether the reply was successfully sent; `false` is never a silent
+ * successful acknowledgement. The returned promise never rejects: callers
+ * detach it, and a settlement that throws (a worker whose link to main's
+ * ledger closed) is logged instead — it neither reopens a reply already
+ * sent nor surfaces as an unhandled rejection.
+ */
+export async function sendA2aReply(options: SendA2aReplyOptions): Promise<boolean> {
+	const { lease, answer } = options;
+	const request = lease.request;
+	const tracked = (async (): Promise<boolean> => {
+		let sent = false;
+		try {
+			let peer = findPeer(options.bridge, request);
+			if (peer === undefined) {
+				await options.rescan();
+				peer = findPeer(options.bridge, request);
+			}
+			if (peer === undefined) {
+				logUnresolvedSender(options.bridge, request);
+			} else {
+				const send = options.send ?? spawnA2aAgent;
+				const result = await send({
+					agent: peer,
+					prompt: answer,
+					inReplyTo: request.messageId,
+					fromIdentity: await options.identity(),
+					...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+				});
+				sent = result.exitCode === 0;
+				if (!sent) {
+					logger.warn("A2A reply relay failed", { from: request.from, error: result.error ?? result.output });
+				}
+			}
+		} catch (error) {
+			logger.warn("A2A reply relay failed", { from: request.from, error: String(error) });
+		}
+		try {
+			const ledger = IncomingRequests.global();
+			await (sent ? ledger.confirm(lease.leaseId) : ledger.release(lease.leaseId));
+		} catch (error) {
+			logger.warn("A2A reply relay: incoming lease settlement failed", {
+				from: request.from,
+				outcome: sent ? "confirm" : "release",
+				error: String(error),
+			});
+		}
+		return sent;
+	})();
+	detachedSends.add(tracked);
+	void tracked.finally(() => {
+		detachedSends.delete(tracked);
+	});
+	return tracked;
 }
