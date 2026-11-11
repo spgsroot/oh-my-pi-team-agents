@@ -147,6 +147,55 @@ describe("sendA2aReply", () => {
 		expect(await IncomingRequests.global().list("Scout")).toEqual([]);
 	});
 
+	it.each([
+		{ exitCode: 0, settles: "confirm", sent: true },
+		{ exitCode: 1, settles: "release", sent: false },
+	] as const)(
+		"never rejects when the lease $settles throws (a closed worker link)",
+		async ({ exitCode, settles, sent: expected }) => {
+			// The detached send runs in a worker whose ledger proxy can reject once
+			// its link closes; the settlement failure must not reopen an answered
+			// request or reject the promise callers `void`.
+			const bridge = new A2aAgentBridge();
+			peer(bridge, "builder");
+			const ledger = new IncomingRequests();
+			await ledger.note({ from: "builder", messageId: "req-link", to: "Scout", at: 100 });
+			const lease = await ledger.consume({ to: "Scout", messageId: "req-link" });
+			const settled: string[] = [];
+			IncomingRequests.installGlobal({
+				note: ledger.note.bind(ledger),
+				consume: ledger.consume.bind(ledger),
+				discard: ledger.discard.bind(ledger),
+				list: ledger.list.bind(ledger),
+				confirm: async () => {
+					settled.push("confirm");
+					throw new Error("link closed");
+				},
+				release: async () => {
+					settled.push("release");
+					throw new Error("link closed");
+				},
+			});
+			vi.spyOn(logger, "warn").mockImplementation(() => {});
+			try {
+				const delivered = await sendA2aReply({
+					bridge,
+					lease: lease!,
+					answer: "answer",
+					identity: async () => ({ name: "reviewer" }),
+					rescan: async () => {},
+					send: async () => ({ exitCode, output: "out", state: TASK_STATE.WORKING }),
+				});
+				expect(delivered).toBe(expected);
+				// One settlement attempt, matching the send outcome — a failed
+				// confirm is not retried as a release that would reopen it.
+				expect(settled).toEqual([settles]);
+			} finally {
+				vi.restoreAllMocks();
+			}
+		},
+	);
+
 	it("fromUrl selects the originating endpoint among equal skill ids", async () => {
 		const bridge = new A2aAgentBridge();
 		const names = peerEndpoints(bridge, "builder", ["http://127.0.0.1:7601/", "http://127.0.0.1:7602/"]);

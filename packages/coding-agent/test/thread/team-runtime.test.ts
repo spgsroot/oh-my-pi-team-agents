@@ -189,6 +189,47 @@ describe("team idle notifications", () => {
 		await Bun.sleep(0);
 		expect(received).toHaveLength(3);
 	});
+	it("publishes a settle that lands while the yielding turn still streams at the mirror's idle", async () => {
+		// Live regression: an accepted `yield` ends the run before the agent loop
+		// unwinds, so the executor settles a ref still `running` with a streaming
+		// session. The settle must reach the lead once the mirror reports idle,
+		// and an abort in between must drop it.
+		IrcBus.resetGlobalForTests();
+		const registry = AgentRegistry.global();
+		const received: string[] = [];
+		const lead = {
+			deliverIrcMessage: async (message: { body: string }) => {
+				received.push(message.body);
+				return "injected";
+			},
+		} as unknown as AgentSessionHandle;
+		registry.register({ id: "lead", displayName: "lead", kind: "sub", session: lead, status: "idle" });
+		const child = { isStreaming: true, messages: [] } as unknown as AgentSessionHandle;
+		const ref = registry.register({ id: "worker", displayName: "worker", kind: "sub", session: child });
+		const runtime = new TeamRuntime();
+		const started = await runtime.start(lead, team);
+		started.members.set("worker", { id: "worker", ref });
+
+		registry.markTurnSettled("worker", ref, "Yielded summary");
+		await Bun.sleep(0);
+		expect(received).toHaveLength(0);
+		registry.setStatus("worker", "idle", ref);
+		await Bun.sleep(0);
+		expect(received).toEqual(["worker is idle.\nYielded summary\nagent://worker"]);
+		// A later mid-run idle without a settle stays silent.
+		registry.setStatus("worker", "running", ref);
+		registry.setStatus("worker", "idle", ref);
+		await Bun.sleep(0);
+		expect(received).toHaveLength(1);
+
+		registry.setStatus("worker", "running", ref);
+		registry.markTurnSettled("worker", ref, "Aborted run");
+		registry.setStatus("worker", "aborted", ref);
+		await Bun.sleep(0);
+		expect(received).toHaveLength(1);
+		await runtime.stop(lead, "audit");
+	});
+
 	it("notifies when a reserved member completes before its ref is recorded", async () => {
 		IrcBus.resetGlobalForTests();
 		const registry = AgentRegistry.global();

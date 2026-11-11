@@ -103,6 +103,11 @@ export function isResumable(ref: AgentRef | undefined): boolean {
 	return (ref?.status === "parked" || ref?.status === "aborted") && ref.sessionFile !== null;
 }
 
+/** An idle/settle excerpt bounded to its first three lines and 500 characters; blank text has none. */
+function boundedExcerpt(text: string | undefined): string | undefined {
+	return text?.trim() ? text.split(/\r?\n/, 4).slice(0, 3).join("\n").slice(0, 500) : undefined;
+}
+
 export type RegistryEvent =
 	| { type: "registered"; ref: AgentRef }
 	| { type: "status_changed"; ref: AgentRef; previousStatus: AgentStatus; summary?: string; final?: boolean }
@@ -201,6 +206,11 @@ export class AgentRegistry implements AgentRegistryApi {
 	}
 
 	readonly #refs = new Map<string, AgentRef>();
+	/**
+	 * Settles that arrived while their ref's last turn still streamed, keyed by
+	 * the exact ref: published with `final` on that ref's next running→idle.
+	 */
+	readonly #deferredSettles = new WeakMap<AgentRef, { summary?: string }>();
 	readonly #listeners = new Set<RegistryListener>();
 	/** Last generation minted for a ref object of this registry. */
 	#generation = 0;
@@ -317,8 +327,14 @@ export class AgentRegistry implements AgentRegistryApi {
 		if (ref.status === status) return true;
 		const previousStatus = ref.status;
 		// Only a transition out of `running` carries a completed turn's excerpt.
-		const summary = previousStatus === "running" && status === "idle" ? this.#idleExcerpt(ref) : undefined;
+		let summary = previousStatus === "running" && status === "idle" ? this.#idleExcerpt(ref) : undefined;
 		const leftRunning = previousStatus === "running";
+		// A settle deferred while the turn still streamed is this transition's
+		// to publish; any other way out of `running` (abort, park) drops it.
+		const deferred = leftRunning ? this.#deferredSettles.get(ref) : undefined;
+		if (leftRunning) this.#deferredSettles.delete(ref);
+		const final = deferred !== undefined && status === "idle";
+		if (final) summary ??= boundedExcerpt(deferred.summary);
 		ref.status = status;
 		// Activity describes current work; it is meaningless once the agent
 		// leaves `running`, so drop it to avoid showing stale work in rosters.
@@ -332,7 +348,7 @@ export class AgentRegistry implements AgentRegistryApi {
 		} else if (leftRunning) {
 			ref.lifecycle = { ...ref.lifecycle, terminalAt: ref.lastActivity };
 		}
-		this.#emit({ type: "status_changed", ref, previousStatus, summary });
+		this.#emit({ type: "status_changed", ref, previousStatus, summary, ...(final ? { final: true } : {}) });
 		return true;
 	}
 
@@ -378,12 +394,12 @@ export class AgentRegistry implements AgentRegistryApi {
 	 * running→idle the run-state mirror reports mid-run.
 	 *
 	 * A ref still `running` with nothing streaming is terminalized first, the
-	 * same missed-transition reconciliation {@link markResultAccepted} performs;
-	 * a genuinely streaming session (a wake turn started at the boundary) makes
-	 * the settle a no-op that returns false — the settle is dropped, not
-	 * queued: the turn's outcome already reached its waiters through the wake
-	 * relays, so only the notice is lost, and the ref's own idle transition
-	 * (published by the run-state mirror) never carries `final`.
+	 * same missed-transition reconciliation {@link markResultAccepted} performs.
+	 * A ref whose session still streams — an accepted `yield` ends the run
+	 * before the agent loop unwinds — has its settle deferred: the run-state
+	 * mirror's next running→idle for that exact ref carries `final`, and an
+	 * abort or park in between drops it. An already idle ref (a repeated
+	 * settle) publishes again; notices are never deduped.
 	 *
 	 * `summary` is the turn's yielded summary, used as the notice excerpt when
 	 * the final turn itself carries no text (an empty excerpt after a `yield`).
@@ -393,17 +409,19 @@ export class AgentRegistry implements AgentRegistryApi {
 	markTurnSettled(id: string, expected?: AgentRefExpectation, summary?: string): boolean {
 		const ref = this.#refs.get(id);
 		if (!ref || ref.status === "aborted" || !this.#matchesExpected(ref, expected)) return false;
-		if (ref.status === "running" && ref.session?.isStreaming !== true) {
-			this.setStatus(id, "idle", ref);
+		if (ref.status === "running") {
+			this.#deferredSettles.set(ref, { summary });
+			// With nothing streaming the mirror missed this transition: make it
+			// now, which publishes the settle; otherwise the mirror's idle will.
+			if (ref.session?.isStreaming !== true) this.setStatus(id, "idle", ref);
+			return true;
 		}
 		if (ref.status !== "idle") return false;
 		this.#emit({
 			type: "status_changed",
 			ref,
-			previousStatus: "running",
-			summary:
-				this.#idleExcerpt(ref) ??
-				(summary?.trim() ? summary.split(/\r?\n/, 4).slice(0, 3).join("\n").slice(0, 500) : undefined),
+			previousStatus: ref.status,
+			summary: this.#idleExcerpt(ref) ?? boundedExcerpt(summary),
 			final: true,
 		});
 		return true;
@@ -427,7 +445,7 @@ export class AgentRegistry implements AgentRegistryApi {
 			);
 			if (terminal?.type === "toolCall") excerpt = JSON.stringify(terminal.arguments);
 		}
-		return excerpt.trim() ? excerpt.split(/\r?\n/, 4).slice(0, 3).join("\n").slice(0, 500) : undefined;
+		return boundedExcerpt(excerpt);
 	}
 
 	/**

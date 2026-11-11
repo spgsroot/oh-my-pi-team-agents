@@ -243,12 +243,16 @@ function logUnresolvedSender(bridge: A2aBridgeApi, request: A2aIncomingRequest):
  * is permanently answered); any failure — no reachable peer, a nonzero exit,
  * or a throw — releases it, so the request stays open for a manual reply.
  * Returns whether the reply was successfully sent; `false` is never a silent
- * successful acknowledgement.
+ * successful acknowledgement. The returned promise never rejects: callers
+ * detach it, and a settlement that throws (a worker whose link to main's
+ * ledger closed) is logged instead — it neither reopens a reply already
+ * sent nor surfaces as an unhandled rejection.
  */
 export async function sendA2aReply(options: SendA2aReplyOptions): Promise<boolean> {
 	const { lease, answer } = options;
 	const request = lease.request;
 	const tracked = (async (): Promise<boolean> => {
+		let sent = false;
 		try {
 			let peer = findPeer(options.bridge, request);
 			if (peer === undefined) {
@@ -257,29 +261,34 @@ export async function sendA2aReply(options: SendA2aReplyOptions): Promise<boolea
 			}
 			if (peer === undefined) {
 				logUnresolvedSender(options.bridge, request);
-				await IncomingRequests.global().release(lease.leaseId);
-				return false;
+			} else {
+				const send = options.send ?? spawnA2aAgent;
+				const result = await send({
+					agent: peer,
+					prompt: answer,
+					inReplyTo: request.messageId,
+					fromIdentity: await options.identity(),
+					...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+				});
+				sent = result.exitCode === 0;
+				if (!sent) {
+					logger.warn("A2A reply relay failed", { from: request.from, error: result.error ?? result.output });
+				}
 			}
-			const send = options.send ?? spawnA2aAgent;
-			const result = await send({
-				agent: peer,
-				prompt: answer,
-				inReplyTo: request.messageId,
-				fromIdentity: await options.identity(),
-				...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
-			});
-			if (result.exitCode !== 0) {
-				logger.warn("A2A reply relay failed", { from: request.from, error: result.error ?? result.output });
-				await IncomingRequests.global().release(lease.leaseId);
-				return false;
-			}
-			await IncomingRequests.global().confirm(lease.leaseId);
-			return true;
 		} catch (error) {
 			logger.warn("A2A reply relay failed", { from: request.from, error: String(error) });
-			await IncomingRequests.global().release(lease.leaseId);
-			return false;
 		}
+		try {
+			const ledger = IncomingRequests.global();
+			await (sent ? ledger.confirm(lease.leaseId) : ledger.release(lease.leaseId));
+		} catch (error) {
+			logger.warn("A2A reply relay: incoming lease settlement failed", {
+				from: request.from,
+				outcome: sent ? "confirm" : "release",
+				error: String(error),
+			});
+		}
+		return sent;
 	})();
 	detachedSends.add(tracked);
 	void tracked.finally(() => {

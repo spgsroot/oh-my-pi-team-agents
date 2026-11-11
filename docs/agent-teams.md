@@ -205,10 +205,12 @@ Idle notices, plan submissions, approval/rejection notices and stop
 decline/timeout notices are displayed as **team notices, no reply needed**.
 They are informational: they impose no automatic reply obligation or wake-relay
 loop, and they count as neither a reply nor a promise of one. A notice addressed
-to an agent wakes that agent's reply `wait` (including a member waiting for plan
-approval), but it never interrupts a wait on its own background jobs or
-services: there it stays queued and is delivered as an aside once the wait
-returns. Ordinary progress messages retain their “reply follows later”
+to an agent ends that agent's blocked reply `wait`, and a notice to an idle
+member wakes it for a turn, but it never interrupts a wait on its own
+background jobs or services: there it stays queued and is delivered as an aside
+once the wait returns. Submitting a plan asks the lead nothing, so a member's
+`wait` right after `write team://<name>/plan` does not block for the decision;
+the approval or rejection notice reaches the member as a wake turn instead. Ordinary progress messages retain their “reply follows later”
 presentation and do not end waits. This is different from ordinary request
 wake-relay, which returns a woken subagent's turn output to the requester and is
 not an idle notification. Direct peer messages keep the existing IRC ingress
@@ -324,9 +326,10 @@ as a grant.
    revision (`rev N`). Failed delivery does not produce an approvable
    submission.
 2. The lead runs `/team reject Reviewer [--rev N] Explain how you will verify
-   the result`. The member receives the reason (with `rev N`), the gate stays
-   closed and the old submission is cleared. It must revise and submit again
-   through the same URL.
+   the result`. Like approval, it requires a submitted plan; otherwise it is
+   refused with instructions to submit one. The member receives the reason
+   (with `rev N`), the gate stays closed and the old submission is cleared. It
+   must revise and submit again through the same URL.
 3. The lead runs `/team approve Reviewer [--rev N]`. Approval requires a
    successfully submitted plan; otherwise it is refused with instructions to
    submit one. The member receives a non-request approval notice naming the
