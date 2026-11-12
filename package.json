@@ -82,6 +82,8 @@
 		"test": "bun scripts/ci-test-ts.ts local",
 		"test:ts": "bun scripts/ci-test-ts.ts local-ts",
 		"test:scripts": "bun test scripts",
+		"eval:team-coordination": "bun scripts/eval-team-coordination.ts",
+		"metric:team-coordination": "bun scripts/team-coordination-overhead.ts",
 		"test:rs": "bun scripts/run-rs-task.ts test:rs",
 		"check": "bun run --parallel check:ts check:rs",
 		"check:ts": "bun run check:tools && bun run --filter './packages/*' --sequential --if-present check:types",
