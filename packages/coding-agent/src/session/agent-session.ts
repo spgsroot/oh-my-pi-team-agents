@@ -386,6 +386,7 @@ import { recordCredentialPin, seedCredentialPins } from "./credential-pin";
 import { isDateCwdReminderControl } from "./date-cwd-reminder";
 import { EvalRunner, type EvalRunnerHost, type PythonExecuteOptions } from "./eval-runner";
 import { getTeamClient } from "../thread/services/team-client";
+import { TEAM_PLAN_GATE_READ_TOOLS } from "../task/teams";
 import { resolveWriteTarget } from "../tools/write";
 import { LSP_READONLY_ACTIONS } from "../lsp/servers";
 import {
@@ -5752,21 +5753,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (name === "yield" || name === "handback") return undefined;
 		const blocked: BeforeToolCallResult = {
 			block: true,
-			reason: `plan approval required: send it via write team://${identity.team}/plan`,
+			reason: `plan approval required: send it via write team://${identity.team}/plan, then call wait for the lead's decision`,
 		};
 		try {
 			const pending = await getTeamClient().planPending(this.instanceKey, identity);
 			if (pending === false) return undefined;
 			if (pending !== true) return blocked;
+			if (name === "wait" || TEAM_PLAN_GATE_READ_TOOLS.includes(name)) return undefined;
 			switch (name) {
-				case "read":
-				case "grep":
-				case "glob":
-				case "find":
-				case "ast_grep":
-				case "web_search":
-				case "wait":
-					return undefined;
 				case "lsp":
 					if (isRecord(args) && typeof args.action === "string" && LSP_READONLY_ACTIONS.has(args.action))
 						return undefined;

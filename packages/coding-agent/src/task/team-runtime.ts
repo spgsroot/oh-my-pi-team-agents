@@ -4,6 +4,10 @@ import { logger, prompt } from "@oh-my-pi/pi-utils";
 import { randomUUID } from "node:crypto";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import stopRequestTemplate from "../prompts/system/team-stop-request.md" with { type: "text" };
+import planApprovedTemplate from "../prompts/teams/plan-approved.md" with { type: "text" };
+import planRejectedTemplate from "../prompts/teams/plan-rejected.md" with { type: "text" };
+import planSubmittedTemplate from "../prompts/teams/plan-submitted.md" with { type: "text" };
+import stopNoticeTemplate from "../prompts/teams/stop-notice.md" with { type: "text" };
 import type { TeamCommandMember } from "../thread/services/team-protocol";
 import { TeamLedger, type TeamClaimResult, type TeamTask } from "./team-ledger";
 import { sanitizeTeamHandle, type TeamDefinition } from "./teams";
@@ -82,8 +86,29 @@ interface MemberPlan {
 	epoch: number;
 }
 
+/** `read team://<team>`: the team at a glance for its lead and members. */
+export interface TeamOverview {
+	team: string;
+	description: string;
+	/** The standing instruction every member received (the team file body). */
+	instructions: string;
+	lead: string;
+	members: Array<{
+		handle: string;
+		id: string;
+		agent?: string;
+		status: string;
+		/** Present when this member's changes need an approved plan. */
+		plan?: { revision: number; state: "none" | "submitted" | "approved"; text?: string };
+	}>;
+}
+
 interface RuntimeTeam extends StartedTeam {
 	name: string;
+	description: string;
+	instructions: string;
+	/** Agent definition name per sanitized handle, from the team file. */
+	agents: Map<string, string>;
 	lead: object;
 	leadRef: AgentRef;
 	ledger: TeamLedger;
@@ -178,6 +203,14 @@ export class TeamRuntime {
 				if (!member || member.failure !== undefined || generation !== event.ref.generation) continue;
 				const lead = registry.get(state.leadId);
 				if (!lead || lead.generation !== state.leadRef.generation || lead.session !== state.lead) continue;
+				// An idle lead is woken only when the team as a whole went quiet —
+				// the moment it has results to act on. While another member still
+				// works (or is registering), the notice folds into its next turn.
+				const othersWorking =
+					state.pendingRefs.size > 0 ||
+					[...state.members.values()].some(
+						other => other.id !== event.ref.id && registry.get(other.id)?.status === "running",
+					);
 				void IrcBus.global()
 					.send({
 						from: event.ref.id,
@@ -188,6 +221,7 @@ export class TeamRuntime {
 						progress: true,
 						teamControl: true,
 						teamNotice: true,
+						...(othersWorking ? { quietWhenIdle: true } : {}),
 					})
 					.then(receipt => {
 						if (receipt.outcome === "failed")
@@ -248,6 +282,9 @@ export class TeamRuntime {
 		}
 		const state: RuntimeTeam = {
 			name: team.name,
+			description: team.description,
+			instructions: team.body,
+			agents: new Map(team.members.map(member => [sanitizeTeamHandle(member.handle), member.agent] as const)),
 			lead,
 			leadRef,
 			leadId: leadRef.id,
@@ -396,10 +433,14 @@ export class TeamRuntime {
 			.send({
 				from: intent.id,
 				to: state.leadId,
-				body: `${body} (request ${intent.requestId})`,
+				body: prompt
+					.render(stopNoticeTemplate, { body, requestId: intent.requestId, handle: intent.handle })
+					.trim(),
 				progress: true,
 				teamControl: true,
 				teamNotice: true,
+				// Stop outcomes are the user's to act on (`/team stop --force`).
+				quietWhenIdle: true,
 			})
 			.catch(error => logger.warn("Team stop notification failed", { error: String(error) }));
 	}
@@ -746,9 +787,21 @@ export class TeamRuntime {
 		const receipt = await IrcBus.global().send({
 			from: member.id,
 			to: state.leadId,
-			body: `Plan from ${handle} (${member.id}) for team ${state.name} (rev ${submission}):\n${text}`,
+			body: prompt
+				.render(planSubmittedTemplate, {
+					handle,
+					memberId: member.id,
+					team: state.name,
+					revision: submission,
+					plan: text,
+				})
+				.trim(),
 			progress: true,
 			teamNotice: true,
+			// The one notice that asks: the member's reply wait blocks on it
+			// until the lead's decision answers, and the lead's rendering names
+			// the decision write (outside the body the member is charged for).
+			planSubmission: { team: state.name, handle, revision: submission },
 		});
 		this.#authorize(session, identity);
 		const current = state.members.get(handle);
@@ -788,10 +841,11 @@ export class TeamRuntime {
 		const receipt = await IrcBus.global().send({
 			from: state.leadId,
 			to: member.id,
-			body: `Plan approved for team ${state.name} (rev ${plan.submissions}); mutation tools are available within your existing permissions.`,
+			body: prompt.render(planApprovedTemplate, { team: state.name, revision: plan.submissions }).trim(),
 			progress: true,
 			teamControl: true,
 			teamNotice: true,
+			planDecision: true,
 		});
 		if (receipt.outcome === "failed") throw new Error(`Plan approved, but notification failed: ${receipt.error}`);
 	}
@@ -809,12 +863,50 @@ export class TeamRuntime {
 		const receipt = await IrcBus.global().send({
 			from: state.leadId,
 			to: member.id,
-			body: `Plan rejected for team ${state.name} (rev ${plan.submissions}): ${reason}\nResubmit via write team://${state.name}/plan`,
+			body: prompt
+				.render(planRejectedTemplate, { team: state.name, revision: plan.submissions, reason: reason.trim() })
+				.trim(),
 			progress: true,
 			teamControl: true,
 			teamNotice: true,
+			planDecision: true,
 		});
 		if (receipt.outcome === "failed") throw new Error(`Plan rejected, but notification failed: ${receipt.error}`);
+	}
+
+	/** The team at a glance — roster, live status and plan state — for its lead or a member. */
+	async overview(session: object, identity: TeamIdentity): Promise<TeamOverview> {
+		const { state } = this.#authorize(session, identity);
+		const registry = AgentRegistry.global();
+		return {
+			team: state.name,
+			description: state.description,
+			instructions: state.instructions,
+			lead: state.leadId,
+			members: [...state.members].map(([handle, member]) => {
+				const ref = member.ref && registry.get(member.id);
+				const current = ref && member.ref && ref.generation === member.ref.generation ? ref : undefined;
+				const status =
+					member.failure !== undefined ? "failed" : !member.ref ? "pending" : (current?.status ?? "gone");
+				const plan = state.plans.get(handle);
+				const gated = state.planOverrides.get(handle) ?? state.planApproval;
+				return {
+					handle,
+					id: member.id,
+					...(state.agents.has(handle) ? { agent: state.agents.get(handle) } : {}),
+					status,
+					...(gated
+						? {
+								plan: {
+									revision: plan?.submissions ?? 0,
+									state: plan?.approved ? "approved" : plan?.submitted ? "submitted" : "none",
+									...(plan?.submitted ? { text: plan.submitted } : {}),
+								} as const,
+							}
+						: {}),
+				};
+			}),
+		};
 	}
 
 	async readTasks(session: object, identity: TeamIdentity): Promise<TeamTask[]> {

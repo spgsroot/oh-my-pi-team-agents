@@ -230,6 +230,38 @@ describe("team idle notifications", () => {
 		await runtime.stop(lead, "audit");
 	});
 
+	it("wakes an idle lead only when the last working member goes idle", async () => {
+		// Each idle notice used to wake the lead for a "noted, no action" turn.
+		// While a teammate still works, the notice folds quietly into the lead's
+		// next turn; the member that leaves the team quiet wakes it to act.
+		IrcBus.resetGlobalForTests();
+		const registry = AgentRegistry.global();
+		const received: Array<{ from: string; quietWhenIdle?: boolean }> = [];
+		const lead = {
+			deliverIrcMessage: async (message: { from: string; quietWhenIdle?: boolean }) => {
+				received.push(message);
+				return "injected";
+			},
+		} as unknown as AgentSessionHandle;
+		registry.register({ id: "lead", displayName: "lead", kind: "sub", session: lead, status: "idle" });
+		const child = { messages: [] } as unknown as AgentSessionHandle;
+		const first = registry.register({ id: "first", displayName: "first", kind: "sub", session: child });
+		const second = registry.register({ id: "second", displayName: "second", kind: "sub", session: child });
+		const runtime = new TeamRuntime();
+		const started = await runtime.start(lead, team);
+		started.members.set("first", { id: "first", ref: first });
+		started.members.set("second", { id: "second", ref: second });
+
+		registry.markTurnSettled("first", first);
+		await Bun.sleep(0);
+		expect(received).toEqual([expect.objectContaining({ from: "first", quietWhenIdle: true })]);
+		registry.markTurnSettled("second", second);
+		await Bun.sleep(0);
+		expect(received[1]).toMatchObject({ from: "second" });
+		expect(received[1]!.quietWhenIdle).toBeUndefined();
+		await runtime.stop(lead, "audit");
+	});
+
 	it("notifies when a reserved member completes before its ref is recorded", async () => {
 		IrcBus.resetGlobalForTests();
 		const registry = AgentRegistry.global();
@@ -1301,10 +1333,15 @@ describe("team plan approval", () => {
 		await runtime.submitPlan(child, identity, "Inspect before editing");
 		expect(notices.at(-1)).toMatchObject({ from: "worker", to: "lead", progress: true });
 		expect(notices.at(-1)!.body).toContain("Inspect before editing");
-		expect(IrcBus.global().unansweredSends("worker", 0)).toEqual([]);
+		// The plan asks the lead for a decision the member may wait on.
+		expect(IrcBus.global().unansweredSends("worker", 0)).toEqual([
+			{ to: "lead", sentAt: expect.any(Number), promised: true },
+		]);
 		await runtime.reject(lead, "worker", "Include regression coverage");
 		expect(notices.at(-1)).toMatchObject({ from: "lead", to: "worker", progress: true });
 		expect(notices.at(-1)!.body).toContain("Include regression coverage");
+		// The decision answers the member's plan and asks the member nothing.
+		expect(IrcBus.global().unansweredSends("worker", 0)).toEqual([]);
 		expect(IrcBus.global().unansweredSends("lead", 0)).toEqual([]);
 		await expect(runtime.approve(lead, "worker")).rejects.toThrow("write team://audit/plan");
 		expect(await runtime.planPending(child, identity)).toBe(true);

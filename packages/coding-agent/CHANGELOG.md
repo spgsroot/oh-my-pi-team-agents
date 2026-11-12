@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Added
+- A team lead agent can decide a member's plan itself with `write team://<team>/plan/<member>` (`approve [--rev N]` or `reject [--rev N]: <reason>`), the same authority as `/team approve|reject`
+- `/team start` gives the lead a hidden protocol note for its next turn (roster, the members' instructions, channels, how to decide plans) and warns when a member's instructions name a tool its agent cannot call in the session
+- `read team://<team>` shows the team at a glance — roster, live status, and each gated member's plan with its revision — and an invalid `team://` path is refused with the list of valid ones
+- `bun run metric:team-coordination` scores session transcripts for time agents spend hunting for the team protocol, and `bun run eval:team-coordination --model <id>` runs a live team scenario against it
 - The A2A agent card now advertises every agent its delivery path can actually reach — Main first, then running subagents, kept-alive idle subagents, and parked subagents the lifecycle can revive — each group ordered by newest last activity (id as the tie-breaker), with `a2a.maxPeerSkills` applied after that ordering. Addressed `SendMessage` delivery wakes an idle kept-alive child through the IRC bus and revives a supported parked child through the existing persisted-revive path, never spawning a fresh same-named agent; the response task reports `WORKING` (a wake/revive turn started) instead of a completed prior turn. A recipient removed between discovery and delivery, an aborted agent, or a parked ref nothing can revive fails with the existing unknown-agent contract (`TASK_NOT_FOUND`, HTTP 404) with no incoming-request residue; a still-registered idle corpse (no live session) is a legitimate lookup refused at delivery with the existing `DELIVERY_FAILED` error (HTTP 200) naming the reason. A wake or revive is never started before the bearer token is verified.
 - Teams can coordinate atomic task claims through `team://`, with lead-only task creation, owner/lead completion and release, persistent workspace `tasks.json`, and a generated `TASKS.md` view; omit the workspace for an in-memory ledger. Legacy `TASKS.md` files without a ledger require migration rather than being overwritten.
 - Team leads, including non-Main sessions, receive non-request idle notices with member links and available turn summaries, without automatic reply loops.
@@ -42,6 +46,9 @@
 
 ### Fixed
 
+- A team member's `wait` after submitting its plan now blocks until the lead decides, instead of returning at once and ending the run in reminder loops
+- Plan, rejection, approval and stop notices tell the agent its next step; a member's protocol lists only the pre-approval tools it actually has
+- An idle team lead is no longer woken for every idle or stop notice: those fold into its next turn, and it is woken when the team as a whole goes quiet or a plan needs a decision
 - A team member whose run ends with `yield` now sends its lead the idle notice; previously the notice was dropped because the run settled while its last turn was still streaming
 - An automatic A2A reply whose incoming-request bookkeeping fails (for example a subagent worker shutting down) is logged instead of crashing the session, and a reply already sent is no longer reopened for a second answer
 - Team stop/status and plan/task operations reject stale or unrelated replacement members. Whole-team stops retire the generation after members are removed. Already-aborted members release without negotiation, duplicate releases report “stop already pending”, and ambiguous targets are refused. Invalid acknowledgement timeouts clamp to 1 second, and values above the signed 32-bit timer range (2147483647 ms) clamp to that ceiling instead of overflowing `setTimeout` and firing immediately.

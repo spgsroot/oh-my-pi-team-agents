@@ -131,6 +131,9 @@ export class TeamEndpoint implements TeamClient {
 	respondStop(key: string, identity: TeamIdentity, requestId: string, body: string) {
 		return teamRuntime.respondStop(this.#session(key), identity, requestId, body);
 	}
+	overview(key: string, identity: TeamIdentity) {
+		return teamRuntime.overview(this.#session(key), identity);
+	}
 	readTasks(key: string, identity: TeamIdentity) {
 		return teamRuntime.readTasks(this.#session(key), identity);
 	}

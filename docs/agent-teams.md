@@ -49,6 +49,10 @@ Audit covers services X and Y; the lead collects the final report.
 3. Run `/team start audit run the audit`. With no ID collisions, members spawn
    as `Scout` and `Reviewer` and appear in the Agent Hub. The optional workspace
    gets an authoritative `tasks.json` ledger and a generated `TASKS.md` view.
+   The lead session receives a hidden protocol note for its next turn: the
+   member roster, the `agent://`/`team://` channels, how to decide plans, and
+   that team notices need no reply. A warning names any tool a member's
+   instructions mention that its agent cannot call in this session.
 4. Read `team://audit/tasks`, message a member with `write agent://Scout`, and
    inspect `/team status audit`. The reviewer must submit a plan before mutation
    tools can pass the approval gate; approval still does not grant this read-only
@@ -130,17 +134,25 @@ are tool content, not extra URL segments.
 
 | Operation | Authorized caller | Example body / result |
 |---|---|---|
+| `read team://audit` | Lead or member | JSON overview: description, standing instructions, lead, and per member its handle, id, agent, live status and — when it needs approval — `plan` `{revision, state: none|submitted|approved, text}`. |
 | `read team://audit/tasks` | Lead or member | JSON array of `{id, title, owner, status, note}` rows. |
 | `write team://audit/tasks` | Lead only | `Inspect service Z` adds a title. |
 | `write team://audit/tasks/1/claim` | Lead or member | Empty body; identity comes from the session. Returns `claimed` or `already-owned` with `owner`; a conflict errors with the current owner's ID. |
 | `write team://audit/tasks/1/release` | Owner or lead | Empty body; clears owner and note and reopens the task. |
 | `write team://audit/tasks/1/done` | Owner or lead | `Collected logs; report sent to lead.` becomes the completion note. |
 | `write team://audit/plan` | Member only | `Inspect the logs, compare findings, then report evidence.` submits the caller's plan. |
+| `write team://audit/plan/Reviewer` | Lead only | `approve --rev 2` or `reject --rev 2: Explain how you will verify` decides the member's plan, like `/team approve|reject`. |
 | `write team://audit/stop/<requestId>` | Targeted current member only | `ack` or `decline: Still collecting evidence`; use the request ID from the stop message. |
 
-Task IDs are positive decimal strings (`"1"`, `"2"`, …). Only the task-list URL
-can be read; plan and stop URLs are write-only. Unknown IDs, malformed paths,
-query parameters and fragments are refused.
+Task IDs are positive decimal strings (`"1"`, `"2"`, …). Only the team overview
+and task-list URLs can be read; task actions, plan and stop URLs are
+write-only. Unknown IDs, malformed paths, query parameters and fragments are
+refused, and the refusal lists every valid `team://` path so an agent that
+guessed corrects itself in one step.
+
+A member whose changes need approval is told so outright in its protocol: submit
+the plan through `write team://<team>/plan` before changing anything, then
+`wait`. A plan written only in a reply or final text is not a submission.
 
 For example, after Scout writes to `team://audit/tasks/1/claim`, the first row is:
 
@@ -204,13 +216,22 @@ fail under the ordinary IRC guard or recipient availability constraints.
 Idle notices, plan submissions, approval/rejection notices and stop
 decline/timeout notices are displayed as **team notices, no reply needed**.
 They are informational: they impose no automatic reply obligation or wake-relay
-loop, and they count as neither a reply nor a promise of one. A notice addressed
-to an agent ends that agent's blocked reply `wait`, and a notice to an idle
-member wakes it for a turn, but it never interrupts a wait on its own
-background jobs or services: there it stays queued and is delivered as an aside
-once the wait returns. Submitting a plan asks the lead nothing, so a member's
-`wait` right after `write team://<name>/plan` does not block for the decision;
-the approval or rejection notice reaches the member as a wake turn instead. Ordinary progress messages retain their “reply follows later”
+loop, and they count as neither a reply nor a promise of one — except the plan
+exchange: a submission is an ask the lead owes a decision on, and the lead's
+approval or rejection answers it, so a member's `wait` after
+`write team://<name>/plan` blocks until the decision arrives. A notice addressed
+to an agent ends that agent's blocked reply `wait`, but it never interrupts a
+wait on its own background jobs or services: there it stays queued and is
+delivered as an aside once the wait returns.
+
+A notice to an idle agent wakes it for a turn only when there is something to
+act on: plan submissions and decisions, the "team finished" notice, and the idle
+notice of the member that leaves the whole team quiet (no other member running
+or still registering). Idle notices while teammates still work, and stop
+decline/timeout/failure notices (the user's to act on with `/team stop
+--force`), fold into the idle agent's context for its next turn instead of
+starting one. A running agent sees every notice at its next step boundary as
+before. Ordinary progress messages retain their “reply follows later”
 presentation and do not end waits. This is different from ordinary request
 wake-relay, which returns a woken subagent's turn output to the requester and is
 not an idle notification. Direct peer messages keep the existing IRC ingress
@@ -308,8 +329,12 @@ unlisted actions are blocked. Other tools, disk writes, `edit`, `bash`, `task`
 and `xd://` dispatch are blocked with:
 
 ```text
-plan approval required: send it via write team://audit/plan
+plan approval required: send it via write team://audit/plan, then call wait for the lead's decision
 ```
+
+The member's protocol prompt lists only those pre-approval tools the member can
+actually call in the session (for example `find` only when `find.enabled`
+resolves on), so it is never pointed at a missing tool.
 
 This is not session plan mode: IRC wake turns remain enabled. Every team dispatch
 consults the main runtime, including worker calls and extension-rewritten final
@@ -322,18 +347,28 @@ as a grant.
 
 1. The member submits non-empty plan text as the content of
    `write team://audit/plan`. Its trusted session identifies the author; the
-   actual lead receives a non-request notification naming the submission's
-   revision (`rev N`). Failed delivery does not produce an approvable
-   submission.
-2. The lead runs `/team reject Reviewer [--rev N] Explain how you will verify
-   the result`. Like approval, it requires a submitted plan; otherwise it is
+   actual lead receives a notification naming the submission's revision
+   (`rev N`) and the exact decision write. Failed delivery does not produce an
+   approvable submission. The member then calls `wait`, which blocks until the
+   decision arrives.
+2. The lead rejects: the lead agent writes `reject [--rev N]: <reason>` to
+   `team://audit/plan/Reviewer`, or the user runs `/team reject Reviewer [--rev N]
+   <reason>`. Like approval, it requires a submitted plan; otherwise it is
    refused with instructions to submit one. The member receives the reason
-   (with `rev N`), the gate stays closed and the old submission is cleared. It
-   must revise and submit again through the same URL.
-3. The lead runs `/team approve Reviewer [--rev N]`. Approval requires a
-   successfully submitted plan; otherwise it is refused with instructions to
-   submit one. The member receives a non-request approval notice naming the
-   approved revision, with no reply required.
+   (with `rev N`) and the next step, the gate stays closed and the old
+   submission is cleared. It must revise and submit again through the same URL.
+3. The lead approves: the lead agent writes `approve [--rev N]` to
+   `team://audit/plan/Reviewer`, or the user runs `/team approve Reviewer
+   [--rev N]`. Approval requires a successfully submitted plan; otherwise it is
+   refused with instructions to submit one. The member receives a non-request
+   approval notice naming the approved revision, with no reply required.
+
+`write team://<team>/plan/<member>` answers with
+`{"decision":"approved"|"rejected","member":"<id>","revision":N}`. Its body is
+`approve`, `approve --rev N`, `reject: <reason>` or `reject --rev N: <reason>`;
+anything else is refused with that usage. It is authorized exactly like the
+commands: only the session that leads the URL's team may write it, and the
+member must belong to that team.
 
 Only the current lead can approve/reject its members. Ambiguous handles,
 nonmembers, stale generations and replaced refs are refused. The revision
@@ -371,6 +406,23 @@ All `/team` commands require `team.enabled: true`.
 | `team.enabled` | `false` | Enables the experimental `/team` commands. |
 | `team.maxTeammates` | `4` | Caps members selected per start; skipped members are reported. |
 | `team.stopAckTimeoutMs` | `120000` | Cooperative-stop acknowledgement deadline in milliseconds; clamped to 1000..2147483647, with no forced release on timeout. |
+
+## Measuring coordination overhead
+
+`bun run metric:team-coordination <session.jsonl | dir>... [--max-discovery-share 0.1]`
+classifies every tool call in the given transcripts (a directory is searched
+recursively): **discovery** — hunting for how the harness works (reading
+`omp://` docs, grepping its source, `omp --help`, listing `agent://`, writing a
+`team://` path the protocol does not serve); **coordination** — `agent://`,
+`team://`, `wait`, `yield`/`handback`, `a2a:` tasks; **work** — everything else.
+It also counts stalled-turn reminders, and exits 1 when the discovery share
+exceeds the threshold.
+
+`bun run eval:team-coordination --model <provider/id>` runs a live scenario — a
+lead and a plan-gated member add a function to a scratch project — and scores
+its transcripts with the same metric. It needs model credentials, so it is not
+part of the unit suites; run it when changing team prompts, notices or the
+protocol.
 
 ## Source
 

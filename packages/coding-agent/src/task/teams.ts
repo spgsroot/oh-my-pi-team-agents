@@ -205,11 +205,47 @@ export function sanitizeTeamHandle(handle: string): string {
 	return sanitizeAgentId(handle) ?? "member";
 }
 
-/** Render the per-member context block: team identity, role, workspace, and task protocol. */
+/**
+ * Read-only tools a plan-gated member may call before approval (besides
+ * read-only `lsp` actions, `wait`, and coordination writes). The plan gate
+ * and the member's protocol prompt share this list.
+ */
+export const TEAM_PLAN_GATE_READ_TOOLS: readonly string[] = ["read", "grep", "glob", "find", "ast_grep", "web_search"];
+
+/** Tools every team member keeps for coordination whatever its agent definition lists. */
+const TEAM_COORDINATION_TOOLS = new Set(["write", "wait", "yield", "handback"]);
+
+/**
+ * Built-in tools that `texts` (a member's instructions) name — as `` `tool` ``
+ * or "the tool tool" — but the member cannot call in this session, because its
+ * agent definition omits them or a setting disables them. Sorted, unique.
+ * A member told to call a missing tool spends its turns looking for it.
+ */
+export function unavailableMentionedTools(
+	texts: readonly (string | undefined)[],
+	builtinTools: readonly string[],
+	available: ReadonlySet<string>,
+): string[] {
+	const text = texts.filter(Boolean).join("\n");
+	const missing = new Set<string>();
+	for (const tool of builtinTools) {
+		if (available.has(tool) || TEAM_COORDINATION_TOOLS.has(tool)) continue;
+		const escaped = tool.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+		if (new RegExp(`\`${escaped}\`|\\bthe ${escaped} tool\\b`, "i").test(text)) missing.add(tool);
+	}
+	return [...missing].sort();
+}
+
+/**
+ * Render the per-member context block: team identity, role, workspace, and task protocol.
+ * `availableTools`, when known, narrows the pre-approval tool list to the
+ * tools this member actually has, so the prompt never promises a missing one.
+ */
 export function renderTeamMemberContext(
 	team: TeamDefinition,
 	member: TeamMember,
 	memberIds?: ReadonlyMap<TeamMember, string>,
+	availableTools?: ReadonlySet<string>,
 ): string {
 	const handle = memberIds?.get(member) ?? sanitizeTeamHandle(member.handle);
 	const lines: string[] = [
@@ -220,7 +256,9 @@ export function renderTeamMemberContext(
 	if (team.workspace !== undefined) {
 		lines.push(`Team workspace: ${team.workspace}`);
 	}
-	lines.push(prompt.render(teamTaskProtocolTemplate, { teamName: team.name }).trim());
+	const gateTools = TEAM_PLAN_GATE_READ_TOOLS.filter(tool => availableTools?.has(tool) ?? true);
+	const planApprovalRequired = member.planApproval ?? team.planApproval === true;
+	lines.push(prompt.render(teamTaskProtocolTemplate, { teamName: team.name, gateTools, planApprovalRequired }).trim());
 	const peers = team.members.filter(other => other.handle !== member.handle);
 	if (peers.length > 0) {
 		lines.push(

@@ -6,6 +6,7 @@ import type { AgentSession } from "../src/session/agent-session";
 import { teamRuntime } from "../src/task/team-runtime";
 import { registerLocalSession } from "../src/thread/session-directory";
 import type { ToolSession } from "../src/tools";
+import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 
 describe("team:// routing", () => {
 	it("submits a plan as the actual session author and rejects forged or malformed requests", async () => {
@@ -50,7 +51,10 @@ describe("team:// routing", () => {
 			expect(plans.at(-1)).toMatchObject({ from: ref.id, progress: true });
 			expect(plans.at(-1)!.body).toContain("Inspect and add tests");
 			expect(plans.at(-1)!.body).toContain("rev 1");
-			expect(IrcBus.global().unansweredSends(ref.id, 0)).toEqual([]);
+			// The submission asks the lead for a decision the member may wait on.
+			expect(IrcBus.global().unansweredSends(ref.id, 0)).toEqual([
+				{ to: leadRef.id, sentAt: expect.any(Number), promised: true },
+			]);
 			await expect(router.write(url, "spoofed", { session: tools(outsider) })).rejects.toThrow();
 			await expect(router.write(url, "   ", { session: tools(child) })).rejects.toThrow();
 			for (const target of [`${url}/worker`, `${url}?author=lead`, `${url}#lead`]) {
@@ -59,6 +63,109 @@ describe("team:// routing", () => {
 			await expect(router.resolve(url, { session: tools(child) })).rejects.toThrow();
 		} finally {
 			await teamRuntime.stop(lead, identity.team);
+			registry.unregister(leadRef.id, leadRef);
+			registry.unregister(ref.id, ref);
+		}
+	});
+
+	it("lets the lead decide a member's plan through team:// and refuses anyone else", async () => {
+		// Without this route a lead agent receiving "Plan from …" had no tool to
+		// answer it and spent its turns hunting for one; only the user could act.
+		const registry = AgentRegistry.global();
+		const suffix = crypto.randomUUID();
+		const toLead: IrcMessage[] = [];
+		const toChild: Array<{ body: string; planDecision?: boolean }> = [];
+		const lead = {
+			instanceKey: `decide-lead:${suffix}`,
+			deliverIrcMessage: async (message: IrcMessage) => {
+				toLead.push(message);
+				return "injected";
+			},
+		} as unknown as AgentSession;
+		const child = {
+			instanceKey: `decide-child:${suffix}`,
+			deliverIrcMessage: async (message: { body: string; planDecision?: boolean }) => {
+				toChild.push(message);
+				return "injected";
+			},
+		} as unknown as AgentSession;
+		for (const session of [lead, child]) registerLocalSession(session);
+		const leadRef = registry.register({ id: `lead-${suffix}`, displayName: "lead", kind: "main", session: lead });
+		const ref = registry.register({ id: `child-${suffix}`, displayName: "child", kind: "sub", session: child });
+		const team = `decide-${suffix}`;
+		const started = await teamRuntime.start(lead, {
+			name: team,
+			description: "",
+			members: [],
+			body: "",
+			source: "project",
+			filePath: "decide.md",
+			planApproval: true,
+		});
+		started.members.set("worker", { id: ref.id, ref });
+		const memberIdentity = { team, generation: started.generation, memberId: ref.id };
+		const tools = (session: AgentSession, teamIdentity?: typeof memberIdentity): ToolSession =>
+			({
+				cwd: ".",
+				hasUI: false,
+				getSessionFile: () => null,
+				getSessionInstanceKey: () => session.instanceKey,
+				...(teamIdentity ? { teamIdentity } : {}),
+			}) as ToolSession;
+		const router = new InternalUrlRouter();
+		const decide = `team://${team}/plan/worker`;
+		try {
+			await router.write(`team://${team}/plan`, "plan v1", { session: tools(child, memberIdentity) });
+			// The lead's notice carries the decision target its rendering names,
+			// while the body the member is charged for stays its own plan.
+			expect(toLead.at(-1)).toMatchObject({ planSubmission: { team, handle: "worker", revision: 1 } });
+			expect(toLead.at(-1)!.body).not.toContain("Decide it");
+
+			// `read team://<team>` answers "what is there to decide" without docs:
+			// in live runs leads guessed this path to find a plan's revision.
+			const overview = await router.resolve(`team://${team}`, { session: tools(lead) });
+			expect(JSON.parse(String(overview.content))).toMatchObject({
+				team,
+				lead: leadRef.id,
+				members: [{ handle: "worker", id: ref.id, plan: { revision: 1, state: "submitted", text: "plan v1" } }],
+			});
+			// A guessed path is refused with every valid one, so the next call is right.
+			await expect(
+				router.write(`team://${team}/tasks/1`, '{"status":"done"}', { session: tools(child, memberIdentity) }),
+			).rejects.toThrow(`write team://${team}/tasks/<id>/claim | release | done`);
+
+			// Only the lead decides; the member itself is refused.
+			await expect(router.write(decide, "approve", { session: tools(child, memberIdentity) })).rejects.toThrow(
+				/Only the lead/,
+			);
+			// Malformed bodies and stale revisions change nothing.
+			await expect(router.write(decide, "reject", { session: tools(lead) })).rejects.toThrow(/needs a reason/);
+			await expect(router.write(decide, "maybe", { session: tools(lead) })).rejects.toThrow(/Invalid plan decision/);
+			await expect(router.write(decide, "approve --rev 2", { session: tools(lead) })).rejects.toThrow(
+				/Stale plan revision 2; current is 1/,
+			);
+			await expect(router.write(`team://${team}/plan/nobody`, "approve", { session: tools(lead) })).rejects.toThrow(
+				/No member "nobody"/,
+			);
+			expect(toChild).toHaveLength(0);
+
+			const rejected = await router.write(decide, "reject --rev 1: add tests", { session: tools(lead) });
+			const [block] = rejected ? rejected.content : [];
+			expect(JSON.parse(block?.type === "text" ? block.text : "null")).toEqual({
+				decision: "rejected",
+				member: ref.id,
+				revision: 1,
+			});
+			expect(toChild.at(-1)).toMatchObject({ planDecision: true });
+			expect(toChild.at(-1)!.body).toContain("add tests");
+			// The decision answered the member's plan ask.
+			expect(IrcBus.global().unansweredSends(ref.id, 0)).toEqual([]);
+
+			await router.write(`team://${team}/plan`, "plan v2", { session: tools(child, memberIdentity) });
+			await router.write(decide, "approve --rev 2", { session: tools(lead) });
+			expect(await teamRuntime.planPending(child, memberIdentity)).toBe(false);
+		} finally {
+			await teamRuntime.stop(lead, team);
 			registry.unregister(leadRef.id, leadRef);
 			registry.unregister(ref.id, ref);
 		}
@@ -120,7 +227,7 @@ describe("team:// routing", () => {
 			const router = new InternalUrlRouter();
 			await expect(
 				router.write("team://audit/stop/request-123", "ack", { session: firstSession }),
-			).rejects.not.toThrow("Invalid team task URL");
+			).rejects.not.toThrow("Invalid team URL");
 			await expect(router.resolve("team://audit/stop/request-123", { session: firstSession })).rejects.toThrow();
 			for (const url of [
 				"team://audit/stop/",

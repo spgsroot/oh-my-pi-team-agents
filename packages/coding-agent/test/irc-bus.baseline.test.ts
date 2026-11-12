@@ -191,6 +191,40 @@ describe("IrcBus baseline", () => {
 		expect(bus.sentSince("0-Rep", "0-Ask", t0)).toBe(true);
 	});
 
+	it("a plan submission stays a promised ask until the lead's plan decision answers it", async () => {
+		// A member that waits after submitting its plan must block on the lead's
+		// decision instead of being told nobody owes it anything.
+		const lead = makeFakeSession();
+		const member = makeFakeSession();
+		registry.register({ id: "0-Lead", displayName: "lead", kind: "main", session: lead.session });
+		registry.register({ id: "0-Mem", displayName: "mem", kind: "sub", session: member.session });
+
+		const t0 = Date.now();
+		await bus.send({
+			from: "0-Mem",
+			to: "0-Lead",
+			body: "Plan from mem (rev 1)",
+			progress: true,
+			teamNotice: true,
+			planSubmission: { team: "audit", handle: "mem", revision: 1 },
+		});
+		expect(bus.unansweredSends("0-Mem", t0)).toEqual([{ to: "0-Lead", sentAt: expect.any(Number), promised: true }]);
+
+		// An informational notice from the lead (no decision) answers nothing.
+		await bus.send({ from: "0-Lead", to: "0-Mem", body: "Stop requested", progress: true, teamNotice: true });
+		expect(bus.unansweredSends("0-Mem", t0)).toHaveLength(1);
+
+		await bus.send({
+			from: "0-Lead",
+			to: "0-Mem",
+			body: "Plan approved (rev 1)",
+			progress: true,
+			teamNotice: true,
+			planDecision: true,
+		});
+		expect(bus.unansweredSends("0-Mem", t0)).toEqual([]);
+	});
+
 	it("a waiter that refuses team notices leaves the notice to ordinary delivery", async () => {
 		const sink = makeFakeSession();
 		registry.register({ id: "0-Sink", displayName: "sink", kind: "sub", session: sink.session });

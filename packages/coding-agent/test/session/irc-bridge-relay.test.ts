@@ -430,3 +430,79 @@ describe("IrcBridge broadcast legs reaching a streaming recipient", () => {
 		expect(bridge.drainInboxMessages("Child")).toMatchObject([{ id: "b2", from: "Peer", broadcast: true }]);
 	});
 });
+
+describe("IrcBridge quiet team notices", () => {
+	function quietHost() {
+		const woken: AgentMessage[][] = [];
+		const folded: AgentMessage[] = [];
+		const persisted: string[] = [];
+		const host = {
+			isDisposed: () => false,
+			isStreaming: () => false,
+			planModeEnabled: () => false,
+			hasWakeRelay: () => false,
+			emitSessionEvent: async () => {},
+			wakeForIrc: (records: AgentMessage[]) => {
+				woken.push(records);
+			},
+			agent: { appendMessage: (message: AgentMessage) => folded.push(message) },
+			sessionManager: { appendCustomMessageEntry: (customType: string) => persisted.push(customType) },
+		} as unknown as IrcBridgeHost;
+		return { bridge: new IrcBridge(host), woken, folded, persisted };
+	}
+
+	it("folds an informational notice into an idle lead's next turn instead of waking it", async () => {
+		// A lead woken for every idle notice spends a model turn saying
+		// "noted, no action". A quiet notice must reach its context without a turn.
+		const quiet = quietHost();
+		const outcome = await quiet.bridge.deliver({
+			id: "n1",
+			ts: 1,
+			from: "Scout",
+			to: "lead",
+			body: "Scout is idle.",
+			progress: true,
+			teamNotice: true,
+			quietWhenIdle: true,
+		});
+		expect(outcome).toBe("injected");
+		expect(quiet.woken).toHaveLength(0);
+		expect(quiet.folded).toHaveLength(1);
+		expect(quiet.persisted).toEqual(["irc:incoming"]);
+
+		// An actionable notice (no quiet flag) still wakes the idle lead.
+		const loud = quietHost();
+		expect(
+			await loud.bridge.deliver({
+				id: "n2",
+				ts: 2,
+				from: "Reviewer",
+				to: "lead",
+				body: "Plan from Reviewer",
+				progress: true,
+				teamNotice: true,
+			}),
+		).toBe("woken");
+		expect(loud.woken).toHaveLength(1);
+		expect(loud.folded).toHaveLength(0);
+	});
+
+	it("shows the lead the exact decision write for a member's plan", async () => {
+		// The lead answers a plan from the notice alone: the rendering names the
+		// write and revision, so it never has to look the protocol up.
+		const { bridge, woken } = quietHost();
+		await bridge.deliver({
+			id: "p1",
+			ts: 3,
+			from: "Reviewer",
+			to: "lead",
+			body: "Plan from Reviewer (Reviewer) for team audit (rev 2):\nCheck the parser",
+			progress: true,
+			teamNotice: true,
+			planSubmission: { team: "audit", handle: "Reviewer", revision: 2 },
+		});
+		const rendered = (woken[0]![0] as CustomMessage).content as string;
+		expect(rendered).toContain("`write team://audit/plan/Reviewer` with body `approve --rev 2`");
+		expect(rendered).toContain("`reject --rev 2: <what to change>`");
+	});
+});

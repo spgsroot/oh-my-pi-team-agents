@@ -310,6 +310,7 @@ export class IrcBridge {
 				replyTo: msg.replyTo ?? "",
 				progress: msg.progress === true,
 				teamNotice: msg.teamNotice === true,
+				planSubmission: msg.teamNotice === true ? msg.planSubmission : undefined,
 				interrupting: streaming && !quiet,
 				relayOnStop,
 				a2aAutoReply: msg.to === MAIN_AGENT_ID || this.#host.hasWakeRelay?.() === true,
@@ -359,7 +360,10 @@ export class IrcBridge {
 			}
 			return "injected";
 		}
-		if (this.#host.planModeEnabled()) {
+		// Plan mode stays user-driven, and an informational team notice needs no
+		// turn of its own: both fold into context for the next turn instead of
+		// waking the idle agent.
+		if (this.#host.planModeEnabled() || (msg.teamNotice === true && msg.quietWhenIdle === true)) {
 			this.#host.agent.appendMessage(record);
 			this.#host.sessionManager.appendCustomMessageEntry(
 				record.customType,

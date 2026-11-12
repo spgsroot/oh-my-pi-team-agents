@@ -151,12 +151,18 @@ export class IrcBus implements IrcBusApi {
 	readonly #waiters = new Map<string, IrcWaiter[]>();
 	/** The latest successful message other than ordinary progress or a team notice per `from` → `to`; see {@link sentSince}. */
 	readonly #lastSent = new Map<string, Map<string, SendMark>>();
-	/** The latest direct request (not a broadcast, progress or team notice); see {@link unansweredSends}. */
+	/** The latest direct request (not a broadcast, progress or team notice other than a plan submission); see {@link unansweredSends}. */
 	readonly #lastDirect = new Map<string, Map<string, SendMark>>();
 	/** The latest ordinary progress per `from` → `to`: a promise that a reply will follow. */
 	readonly #lastProgress = new Map<string, Map<string, SendMark>>();
 	/** The latest job-carried reply per agent → owner; see {@link IrcBus.recordReply}. */
 	readonly #lastJobReply = new Map<string, Map<string, SendMark>>();
+	/**
+	 * The latest plan submission per member → lead: the direct ask (in
+	 * {@link #lastDirect}) whose decision the lead owes, so it stays promised
+	 * until a plan decision answers it; see {@link unansweredSends}.
+	 */
+	readonly #planAsks = new Map<string, Map<string, SendMark>>();
 	/** Last {@link SendMark.seq} handed out, taken when a send starts. */
 	#sendSeq = 0;
 
@@ -213,7 +219,17 @@ export class IrcBus implements IrcBusApi {
 		const mark: SendMark = { ts: message.ts, seq: ++this.#sendSeq };
 		const receipt = await this.#deliver(message);
 		// A team notice is informational: it answers nothing, promises nothing
-		// and never stands in for the reply a wake relay would skip.
+		// and never stands in for the reply a wake relay would skip. The plan
+		// exchange is the one exception: a submission asks the lead for a
+		// decision the member's reply wait blocks on, and the decision answers it.
+		if (receipt.outcome !== "failed" && message.teamNotice) {
+			if (message.planSubmission) {
+				this.#record(this.#lastDirect, message.from, message.to, mark);
+				this.#record(this.#planAsks, message.from, message.to, mark);
+			} else if (message.planDecision) {
+				this.#record(this.#lastSent, message.from, message.to, mark);
+			}
+		}
 		if (receipt.outcome !== "failed" && !message.teamNotice) {
 			if (message.progress) {
 				this.#record(this.#lastProgress, message.from, message.to, mark);
@@ -296,7 +312,9 @@ export class IrcBus implements IrcBusApi {
 	 * replies a `wait` can block for. A message back answers, and so does a
 	 * settled job of the agent `from` owns, which delivers its result. A team
 	 * notice answers nothing: it is informational and records into no
-	 * accounting table. Ordinary progress only marks the request `promised`,
+	 * accounting table — except the plan exchange, where a member's submission
+	 * is a promised ask to its lead and the lead's decision answers it.
+	 * Ordinary progress only marks the request `promised`,
 	 * after which only an explicit message answers it (a job settling the turn
 	 * that sent the progress must not). "Since" is by send order, not timestamp,
 	 * so an answer to an earlier question never settles a later one sent within
@@ -309,7 +327,9 @@ export class IrcBus implements IrcBusApi {
 		for (const [to, sent] of sends) {
 			if (sent.ts < sinceTs) continue;
 			const after = (table: Map<string, Map<string, SendMark>>) => (table.get(to)?.get(from)?.seq ?? 0) > sent.seq;
-			const promised = after(this.#lastProgress);
+			// A pending plan submission is promised: the lead owes its decision
+			// whether or not it is running when the member waits.
+			const promised = after(this.#lastProgress) || this.#planAsks.get(from)?.get(to)?.seq === sent.seq;
 			if (after(this.#lastSent) || (!promised && after(this.#lastJobReply))) continue;
 			unanswered.push({ to, sentAt: sent.ts, promised });
 		}

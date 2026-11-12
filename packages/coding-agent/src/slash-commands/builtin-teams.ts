@@ -5,6 +5,8 @@
  * and share the team workspace.
  */
 import { randomUUID } from "node:crypto";
+import { logger, prompt } from "@oh-my-pi/pi-utils";
+import teamLeadProtocolTemplate from "../prompts/teams/lead-protocol.md" with { type: "text" };
 import { AgentRegistry } from "../registry/agent-registry";
 import { discoverAgents } from "../task/discovery";
 import { isReadOnlyAgent } from "../task/read-only-policy";
@@ -15,7 +17,9 @@ import {
 	resolveTeamMembers,
 	sanitizeTeamHandle,
 	type TeamDefinition,
+	unavailableMentionedTools,
 } from "../task/teams";
+import { BUILTIN_TOOLS, resolveBuiltinToolPlan, type ToolSession } from "../tools";
 import { SpawnPendingError, spawnSubagentForSession } from "../task/spawn-subagent";
 import { teamRuntime } from "../task/team-runtime";
 import { getTeamClient } from "../thread/services/team-client";
@@ -227,6 +231,40 @@ export const BUILTIN_TEAMS_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 					);
 					return commandConsumed();
 				}
+				// The tools each member can actually call here: its agent definition
+				// narrowed by this session's settings (e.g. `find` needs a native
+				// judge model). Its protocol prompt lists only those, and a team file
+				// that names a missing one is flagged before anything spawns.
+				const memberToolSession = Object.create(toolSession, {
+					taskDepth: { value: (toolSession.taskDepth ?? 0) + 1 },
+					skipPythonPreflight: { value: true },
+				}) as ToolSession;
+				const availableTools = new Map<(typeof members)[number], ReadonlySet<string>>();
+				const toolWarnings: string[] = [];
+				for (const member of members) {
+					const agent = discovery.agents.find(candidate => candidate.name === member.agent)!;
+					// Best effort: an unresolvable tool set narrows nothing and warns
+					// about nothing, rather than blocking the start.
+					let available: Set<string>;
+					try {
+						if (!toolSession.settings) continue;
+						available = new Set((await resolveBuiltinToolPlan(memberToolSession, agent.tools)).names);
+					} catch (error) {
+						logger.debug("Team member tool set unresolved", { member: member.handle, error: String(error) });
+						continue;
+					}
+					availableTools.set(member, available);
+					const missing = unavailableMentionedTools(
+						[team.body, team.context, member.role, assignment],
+						Object.keys(BUILTIN_TOOLS),
+						available,
+					);
+					if (missing.length > 0) {
+						toolWarnings.push(
+							`warning: ${sanitizeTeamHandle(member.handle)}'s instructions name ${missing.map(tool => `\`${tool}\``).join(", ")}, which agent ${member.agent} cannot call in this session; adjust the team file or settings.`,
+						);
+					}
+				}
 				const key = runtime.session.instanceKey;
 				const client = getTeamClient();
 				let started: { generation: number; leadId: string };
@@ -236,7 +274,7 @@ export const BUILTIN_TEAMS_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 					await runtime.output(teamRuntimeError(error instanceof Error ? error.message : String(error)));
 					return commandConsumed();
 				}
-				const lines: string[] = [];
+				const lines: string[] = [...toolWarnings];
 				let failures = 0;
 				const recorded = new Map<string, TeamCommandMember>();
 				const ids = new Map<(typeof members)[number], string>();
@@ -301,7 +339,7 @@ export const BUILTIN_TEAMS_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 						const ref = await spawnSubagentForSession(runtime.session, {
 							agent: member.agent,
 							prompt: renderTeamMemberPrompt(team, assignment),
-							context: renderTeamMemberContext({ ...team, members }, member, ids),
+							context: renderTeamMemberContext({ ...team, members }, member, ids, availableTools.get(member)),
 							handle,
 							teamReservedId: entry.id,
 							teamIdentity: await client.memberIdentity(key, team.name, started.generation, handle),
@@ -388,6 +426,34 @@ export const BUILTIN_TEAMS_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 						? "Team is live: message members with write agent://<handle>; watch them in the Agent Hub."
 						: `${failures} member(s) failed to spawn; the spawned ones keep running.`,
 				);
+				if (failures < members.length) {
+					// The lead agent learns its channels once, in context for its next
+					// turn, instead of hunting docs when the first plan or notice lands.
+					const roster = members.map(member => ({
+						id: ids.get(member) ?? sanitizeTeamHandle(member.handle),
+						agent: member.agent,
+						role: member.role,
+						planApproval: member.planApproval ?? team.planApproval === true,
+					}));
+					await runtime.session.sendCustomMessage(
+						{
+							customType: "team-lead-protocol",
+							content: prompt
+								.render(teamLeadProtocolTemplate, {
+									team: team.name,
+									generation: started.generation,
+									members: roster,
+									anyPlanApproval: roster.some(member => member.planApproval),
+									instructions: team.body.trim(),
+									assignment,
+								})
+								.trim(),
+							display: false,
+							attribution: "agent",
+						},
+						{ deliverAs: "nextTurn" },
+					);
+				}
 				await runtime.output(lines.join("\n"));
 				return commandConsumed();
 			}

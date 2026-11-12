@@ -437,15 +437,31 @@ function mockTeamDiscovery(team: TeamDefinition, agents?: AgentDefinition[]): vo
 	} as never);
 }
 
-function teamRuntime(root: string): { runtime: unknown; outputs: string[] } {
+function teamRuntime(
+	root: string,
+	toolSession: object = { getArtifactsDir: () => null },
+): {
+	runtime: unknown;
+	outputs: string[];
+	leadContext: Array<{ message: { customType: string; content: string }; options?: { deliverAs?: string } }>;
+} {
 	const outputs: string[] = [];
+	const leadContext: Array<{ message: { customType: string; content: string }; options?: { deliverAs?: string } }> =
+		[];
 	const runtime = {
 		settings: Settings.isolated({ "team.enabled": true, "team.maxTeammates": 10 }),
 		cwd: root,
 		session: {
 			instanceKey: `team-test:${crypto.randomUUID()}`,
 			effectiveExtensionRoots: undefined,
-			toolSession: { getArtifactsDir: () => null },
+			toolSession,
+			sendCustomMessage: async (
+				message: { customType: string; content: string },
+				options?: { deliverAs?: string },
+			) => {
+				leadContext.push({ message, options });
+				return false;
+			},
 		},
 		sessionManager: { getCwd: () => root },
 		output: (text: string) => {
@@ -461,7 +477,7 @@ function teamRuntime(root: string): { runtime: unknown; outputs: string[] } {
 		kind: "main",
 		session: runtime.session as unknown as AgentSession,
 	});
-	return { runtime, outputs };
+	return { runtime, outputs, leadContext };
 }
 
 describe("team startup lifecycle", () => {
@@ -623,6 +639,42 @@ describe("/team start and stop", () => {
 		});
 	}
 
+	it("hands the lead its protocol and flags instructions naming a tool the member cannot call", async () => {
+		// Live runs: a lead with no protocol hunted docs and source for how to
+		// answer a plan, and a member told to call a missing tool searched for it.
+		const { team, root, cleanup } = await teamFixture({ handles: ["Scout"] });
+		try {
+			mockTeamDiscovery({ ...team, planApproval: true, body: "Run `ast_grep` over the services, then report." });
+			const spawn = vi.spyOn(spawnSubagent, "spawnSubagentForSession").mockResolvedValue({ id: "Scout" } as never);
+			const toolSession = { getArtifactsDir: () => null, settings: Settings.isolated({}), cwd: root, hasUI: false };
+			const { runtime, outputs, leadContext } = teamRuntime(root, toolSession);
+			await TEAM_HANDLE({ args: "start audit" }, runtime);
+
+			expect(outputs.join("\n")).toContain(
+				"Scout's instructions name `ast_grep`, which agent scout cannot call in this session",
+			);
+			// The member's protocol promises only the pre-approval tools it has.
+			const context = spawn.mock.calls[0]![1].context ?? "";
+			expect(context).toContain("only `read`, `grep`, read-only `lsp` actions");
+			expect(context).not.toContain("`ast_grep`");
+			// A gated member is told outright, not "if required": in live runs a
+			// member wrote its plan into its final text and the lead could not approve it.
+			expect(context).toContain("Your changes need an approved plan.");
+			// The lead gets its channels once, for its next turn, without a turn now.
+			expect(leadContext).toHaveLength(1);
+			expect(leadContext[0]).toMatchObject({
+				message: { customType: "team-lead-protocol" },
+				options: { deliverAs: "nextTurn" },
+			});
+			expect(leadContext[0]!.message.content).toContain("write team://audit/plan/<id>");
+			expect(leadContext[0]!.message.content).toContain("`Scout` (scout): must submit a plan");
+			// The lead knows what its members were told without reading the team file.
+			expect(leadContext[0]!.message.content).toContain("Run `ast_grep` over the services, then report.");
+		} finally {
+			await cleanup();
+		}
+	});
+
 	it("stop releases only the recorded member id, leaving an unrelated same-handle ref running", async () => {
 		const { team, root, cleanup } = await teamFixture({ handles: ["Scout"] });
 		try {
@@ -766,8 +818,10 @@ describe("/team start and stop", () => {
 			const release = vi.spyOn(AgentLifecycleManager.global(), "release").mockResolvedValue(true);
 			const { runtime } = teamRuntime(root);
 			const lead = (runtime as { session: object }).session;
-			Reflect.set(lead, "deliverIrcMessage", async (message: { body: string }) => {
+			const quiet: Array<boolean | undefined> = [];
+			Reflect.set(lead, "deliverIrcMessage", async (message: { body: string; quietWhenIdle?: boolean }) => {
 				notices.push(message.body);
+				quiet.push(message.quietWhenIdle);
 				return "injected";
 			});
 			await TEAM_HANDLE({ args: "start audit" }, runtime);
@@ -782,6 +836,10 @@ describe("/team start and stop", () => {
 			const router = new InternalUrlRouter();
 			await router.write(url!, "decline: busy", { session });
 			expect(notices.join("\n")).toContain("busy");
+			// The user acts on a stop outcome: the notice must not wake an idle lead
+			// for a turn of its own, and says so.
+			expect(quiet.at(-1)).toBe(true);
+			expect(notices.at(-1)).toContain("no reply or action is needed from you");
 			expect(release).not.toHaveBeenCalled();
 			expect(teamRuntimeState.members(lead, "audit")?.has("Scout")).toBe(true);
 			await expect(router.write(url!, "ack", { session })).rejects.toThrow();
