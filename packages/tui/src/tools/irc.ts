@@ -40,6 +40,26 @@ export interface IrcMessage {
 	 */
 	teamNotice?: boolean;
 	/**
+	 * A member's plan submission to its lead: the one team notice that asks
+	 * something. The member's reply `wait` keeps blocking on the lead until a
+	 * `planDecision` answers it, and the lead's rendering names the decision
+	 * write. Kept out of `body`, so the member's rate budget is charged for its
+	 * own plan only. Set by the team runtime; agents never set it.
+	 */
+	planSubmission?: { team: string; handle: string; revision: number };
+	/**
+	 * The lead's approval or rejection of a submitted plan: answers the
+	 * recipient's `planSubmission`. Set by the team runtime; agents never set it.
+	 */
+	planDecision?: boolean;
+	/**
+	 * Informational team notice that needs no action now: an idle recipient
+	 * takes it into its next turn instead of being woken for a turn of its
+	 * own. A running recipient sees it at its next step boundary as usual.
+	 * Set by the team runtime; agents never set it.
+	 */
+	quietWhenIdle?: boolean;
+	/**
 	 * A delivery from outside the agent tree — the A2A bridge. Each such message
 	 * is one authenticated client request identified by its A2A `messageId`, so
 	 * the agent-loop ingress policy does not apply: identical text is a new

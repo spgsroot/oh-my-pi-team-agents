@@ -75,6 +75,9 @@ export class RemoteTeamClient implements TeamClient {
 	respondStop(key: string, identity: TeamIdentity, requestId: string, body: string) {
 		return this.remote.call("respondStop", key, identity, requestId, body);
 	}
+	overview(key: string, identity: TeamIdentity) {
+		return this.remote.call("overview", key, identity);
+	}
 	readTasks(key: string, identity: TeamIdentity) {
 		return this.remote.call("readTasks", key, identity);
 	}

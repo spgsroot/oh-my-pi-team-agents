@@ -644,6 +644,36 @@ describe("wait", () => {
 			expect(await idleText(childWait())).toContain("no agent you messaged this run owes a reply");
 		});
 
+		test("after a plan submission blocks for the lead's decision even while the lead is idle", async () => {
+			// Live regression: a member's wait right after `write team://…/plan`
+			// returned "nothing to wait for", burned its reminders and yielded an
+			// error while the lead was still deciding.
+			const { main } = registerParentAndChild();
+			main.endTurn();
+			await IrcBus.global().send({
+				from: "Child",
+				to: "Main",
+				body: "Plan from Child (rev 1)",
+				progress: true,
+				teamNotice: true,
+				planSubmission: { team: "audit", handle: "Child", revision: 1 },
+			});
+			const waiting = childWait();
+			expect(await stillPending(waiting)).toBe(true);
+			await IrcBus.global().send({
+				from: "Main",
+				to: "Child",
+				body: "Plan approved (rev 1)",
+				progress: true,
+				teamNotice: true,
+				planDecision: true,
+			});
+			const result = await waiting;
+			expect(result.details?.waited).toMatchObject([{ from: "Main", body: "Plan approved (rev 1)" }]);
+			// The decision answered the plan: nothing is owed any more.
+			expect(await idleText(childWait())).toContain("no agent you messaged this run owes a reply");
+		});
+
 		test("blocks for a second question asked in the same millisecond its first was answered", async () => {
 			registerParentAndChild();
 			vi.spyOn(Date, "now").mockReturnValue(1_000_000);

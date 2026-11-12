@@ -1,6 +1,12 @@
 import type { TeamClaimResult, TeamTask } from "../../task/team-ledger";
 import type { AgentRef } from "../../registry/agent-registry";
-import type { StartedTeam, TeamIdentity, TeamMembership, TeamStopResponse } from "../../task/team-runtime";
+import type {
+	StartedTeam,
+	TeamIdentity,
+	TeamMembership,
+	TeamOverview,
+	TeamStopResponse,
+} from "../../task/team-runtime";
 import type { TeamDefinition } from "../../task/teams";
 import type { RpcMethod } from "../rpc";
 
@@ -67,6 +73,7 @@ export type TeamProtocol = {
 		[sessionKey: string, identity: TeamIdentity, requestId: string, body: string],
 		TeamStopResponse
 	>;
+	overview: RpcMethod<[sessionKey: string, identity: TeamIdentity], TeamOverview>;
 	readTasks: RpcMethod<[sessionKey: string, identity: TeamIdentity], TeamTask[]>;
 	addTask: RpcMethod<[sessionKey: string, identity: TeamIdentity, title: string], TeamTask>;
 	claim: RpcMethod<[sessionKey: string, identity: TeamIdentity, id: string], TeamClaimResult>;
@@ -113,6 +120,7 @@ export interface TeamClient {
 		ref?: AgentRef,
 		failure?: string,
 	): Promise<boolean>;
+	overview(sessionKey: string, identity: TeamIdentity): Promise<TeamOverview>;
 	readTasks(sessionKey: string, identity: TeamIdentity): Promise<TeamTask[]>;
 	respondStop(sessionKey: string, identity: TeamIdentity, requestId: string, body: string): Promise<TeamStopResponse>;
 	leadIdentity(sessionKey: string, team: string): Promise<TeamIdentity | undefined>;

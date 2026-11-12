@@ -153,12 +153,22 @@ describe("IrcBus ingress guard", () => {
 			{
 				to: "0-Target",
 				message: "12 characters",
-				...({ teamControl: true, teamNotice: true } as Record<string, unknown>),
+				...({
+					teamControl: true,
+					teamNotice: true,
+					planSubmission: { team: "audit", handle: "0-Target", revision: 1 },
+					planDecision: true,
+					quietWhenIdle: true,
+				} as Record<string, unknown>),
 			},
 		);
-		// The delivered message carries no runtime-only flags.
+		// The delivered message carries no runtime-only flags: an agent cannot
+		// forge a plan decision, hold its peer in a plan wait, or mute a notice.
 		expect(sink.delivered[0]?.teamControl).not.toBe(true);
 		expect(sink.delivered[0]?.teamNotice).not.toBe(true);
+		expect(sink.delivered[0]?.planSubmission).toBeUndefined();
+		expect(sink.delivered[0]?.planDecision).not.toBe(true);
+		expect(sink.delivered[0]?.quietWhenIdle).not.toBe(true);
 
 		// The send was charged like ordinary traffic: a distinct second send in
 		// the same window exceeds the 3-token budget (each body costs 4 tokens).

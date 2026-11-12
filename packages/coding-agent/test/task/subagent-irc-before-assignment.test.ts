@@ -315,7 +315,7 @@ for (const xdev of [false, true]) {
 					undefined as never,
 					undefined as never,
 				),
-			).rejects.toThrow("Invalid team task URL");
+			).rejects.toThrow("Invalid team URL");
 			for (const target of [path.join(cwd, "blocked"), "local://blocked", "xd://anything", "proc://anything/kill"]) {
 				await expect(
 					write!.execute(

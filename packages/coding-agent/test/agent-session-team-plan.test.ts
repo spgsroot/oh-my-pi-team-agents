@@ -25,7 +25,7 @@ import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import { resolveXdevTool, type XdevState } from "@oh-my-pi/pi-coding-agent/tools/xdev";
 import { YieldTool } from "@oh-my-pi/pi-coding-agent/tools/yield";
 
-const required = "plan approval required: send it via write team://audit/plan";
+const required = "plan approval required: send it via write team://audit/plan, then call wait for the lead's decision";
 const sessions: AgentSession[] = [];
 let cwd: string;
 
