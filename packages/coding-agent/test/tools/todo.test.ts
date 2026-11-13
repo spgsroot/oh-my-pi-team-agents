@@ -383,6 +383,74 @@ describe("TodoTool operations", () => {
 		expect(allTasks.map(task => task.status)).toEqual(["completed", "completed", "in_progress"]);
 	});
 
+	// Regression (live run 2026-11-13): an agent marked two tasks done by
+	// re-sending the init shape `done {list:[{phase, items}]}`; `list` was only
+	// consulted by init, so the op had no target and the "every task" fallback
+	// completed all eight tasks — reported as "todo tracker resets everything to
+	// done".
+	it("completes only the tasks named in `list`, not every task", async () => {
+		const tool = new TodoTool(createSession());
+		await tool.execute("call-1", {
+			op: "init",
+			list: [
+				{ phase: "Prep", items: ["Read docs", "Write script", "Debug script"] },
+				{ phase: "Run", items: ["Execute", "Report"] },
+			],
+		});
+
+		const result = await tool.execute("call-2", {
+			op: "done",
+			list: [
+				{ phase: "Prep", items: ["Read docs"] },
+				{ phase: "Run", items: ["Report"] },
+			],
+		});
+		expect(result.isError).toBeUndefined();
+		expect(result.details?.phases.flatMap(phase => phase.tasks.map(task => [task.content, task.status]))).toEqual([
+			["Read docs", "completed"],
+			["Write script", "in_progress"],
+			["Debug script", "pending"],
+			["Execute", "pending"],
+			["Report", "completed"],
+		]);
+	});
+
+	it("refuses a `list` target naming an unknown task instead of completing everything", async () => {
+		const tool = new TodoTool(createSession());
+		await tool.execute("call-1", { op: "init", list: [{ phase: "Prep", items: ["Read docs", "Write script"] }] });
+
+		const result = await tool.execute("call-2", { op: "done", list: [{ phase: "Prep", items: ["No such task"] }] });
+		expect(result.isError).toBe(true);
+		const summary = result.content.find(part => part.type === "text");
+		if (summary?.type !== "text") throw new Error("Expected text summary");
+		expect(summary.text).toContain('Task "No such task" not found');
+		// A failed batch discards wholesale: nothing was completed.
+		expect(result.details?.phases.flatMap(phase => phase.tasks.map(task => task.status))).toEqual([
+			"in_progress",
+			"pending",
+		]);
+	});
+
+	it("completes flat `items` targets, scoped to the named phase", async () => {
+		const tool = new TodoTool(createSession());
+		await tool.execute("call-1", {
+			op: "init",
+			list: [
+				{ phase: "Work", items: ["First", "Second", "Third"] },
+				{ phase: "Other", items: ["Fourth"] },
+			],
+		});
+
+		const result = await tool.execute("call-2", { op: "done", phase: "Work", items: ["First", "Third"] });
+		expect(result.isError).toBeUndefined();
+		expect(result.details?.phases.flatMap(phase => phase.tasks.map(task => [task.content, task.status]))).toEqual([
+			["First", "completed"],
+			["Second", "in_progress"],
+			["Third", "completed"],
+			["Fourth", "pending"],
+		]);
+	});
+
 	it("removes all tasks when rm omits task and phase", async () => {
 		const tool = new TodoTool(createSession());
 		await tool.execute("call-1", {
@@ -395,6 +463,17 @@ describe("TodoTool operations", () => {
 		const summary = result.content.find(part => part.type === "text");
 		if (summary?.type !== "text") throw new Error("Expected text summary");
 		expect(summary.text).toContain("Todo list cleared.");
+	});
+
+	it("removes only the tasks named in `list`", async () => {
+		const tool = new TodoTool(createSession());
+		await tool.execute("call-1", {
+			op: "init",
+			list: [{ phase: "Work", items: ["First", "Second", "Third"] }],
+		});
+
+		const result = await tool.execute("call-2", { op: "rm", list: [{ phase: "Work", items: ["Second"] }] });
+		expect(result.details?.phases[0]?.tasks.map(task => task.content)).toEqual(["First", "Third"]);
 	});
 
 	it("drops all tasks in a phase", async () => {
@@ -495,6 +574,36 @@ describe("TodoTool lenient init shapes", () => {
 		const summary = result.content.find(part => part.type === "text");
 		if (summary?.type !== "text") throw new Error("Expected text summary");
 		expect(summary.text).toContain("Missing list for init operation");
+	});
+
+	// Regression (live run 2026-11-13): the provider/validation layer lossily
+	// stringifies structured items (`{task, description}`) into JSON strings to
+	// satisfy the string-array schema, and those encodings were stored as task
+	// content, leaving unaddressable `{"description":"done","task":"…"}` rows.
+	it("recovers the task text from a JSON-object item", async () => {
+		const tool = new TodoTool(createSession());
+		const result = await tool.execute("call-1", {
+			op: "init",
+			list: [
+				{
+					phase: "Prep",
+					items: ['{"description":"done","task":"Read docs"}', '{"task":"Write script"}'],
+				},
+			],
+		});
+
+		expect(result.isError).toBeUndefined();
+		expect(result.details?.phases[0]?.tasks.map(task => task.content)).toEqual(["Read docs", "Write script"]);
+	});
+
+	it("keeps plain item text that merely starts with a brace", async () => {
+		const tool = new TodoTool(createSession());
+		const result = await tool.execute("call-1", {
+			op: "init",
+			list: [{ phase: "Prep", items: ["{not json}"] }],
+		});
+
+		expect(result.details?.phases[0]?.tasks.map(task => task.content)).toEqual(["{not json}"]);
 	});
 });
 describe("TodoTool lenient op recovery", () => {

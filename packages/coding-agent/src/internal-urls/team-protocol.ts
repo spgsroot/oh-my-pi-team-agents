@@ -78,7 +78,15 @@ async function caller(session: ToolSession | undefined, team: string) {
 	if (!key) throw new Error("team:// requires a registered caller session");
 	const client = getTeamClient();
 	const identity = session?.teamIdentity ?? (await client.leadIdentity(key, team));
-	if (!identity || identity.team !== team) throw new Error("Caller is not a member of this team");
+	// A session that never started the team used to get the member-refusal
+	// text, which reads as a permissions answer and sent leads hunting for
+	// docs. Name the actual state and the command that fixes it instead.
+	if (!identity) {
+		throw new Error(
+			`No team "${team}" is running in this session. Start one with \`/team start ${team}\` (see /team list for the available team files).`,
+		);
+	}
+	if (identity.team !== team) throw new Error("Caller is not a member of this team");
 	return { client, key, identity };
 }
 

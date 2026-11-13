@@ -186,7 +186,20 @@ export async function discoverAgents(
 		}),
 	);
 
-	const bundledAgents = loadBundledAgents().filter(agent => {
+	const bundled = loadBundledAgents();
+	// An override that re-declares a bundled agent (a copied scout.md/reviewer.md
+	// for prompt tweaks) shadows the bundled definition. Without its own
+	// team-prompt it lost the bundled one, so `/team start` refused read-only
+	// members with "has no team prompt". Inherit unless the override brings its
+	// own (broken paths still report teamPromptError) or opts out with
+	// `team: false`.
+	const bundledByName = new Map(bundled.map(agent => [agent.name, agent]));
+	for (const agent of loadedAgents) {
+		if (agent.teamPromptPath !== undefined || agent.teamSystemPrompt !== undefined || agent.team === false) continue;
+		const inherited = bundledByName.get(agent.name)?.teamSystemPrompt;
+		if (inherited !== undefined) agent.teamSystemPrompt = inherited;
+	}
+	const bundledAgents = bundled.filter(agent => {
 		if (seen.has(agent.name)) return false;
 		seen.add(agent.name);
 		return true;

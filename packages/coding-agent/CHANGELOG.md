@@ -46,6 +46,12 @@
 
 ### Fixed
 
+- `todo` with an init-shaped `list` (or flat `items`) on `done`, `drop` or `rm` now targets only the named tasks instead of silently falling back to the whole list, which completed or cleared every task; an unknown task name fails the batch and names the task
+- Task text that arrived as a structured item (`{"task": …, "description": …}`) and was lossily stringified by argument validation is stored as its plain task text instead of the JSON encoding
+- A user-level agent override (a copied `scout.md`/`reviewer.md` for prompt tweaks) that declares no `team-prompt` now inherits the bundled team prompt, so `/team start` no longer refuses read-only members with "has no team prompt"; an explicit `team: false` still opts out
+- `team://` from a session that never started the team now says no such team is running and names `/team start <team>`, instead of "Caller is not a member of this team"
+- `/team start` with an unknown name now names the team-file locations (`.omp/teams/<name>.md` project, `~/.omp/agent/teams/<name>.md` user) next to the discovered list
+- `CancelTask` now keeps the task `TASK_STATE_CANCELED`: the canceled generation is stamped `aborted` even when the abort settles the run, so a queued wake can no longer flip it back to `WORKING`, and later `SendMessage`s to it are refused; a run that finished with a published result during the cancel keeps `COMPLETED`
 - A team member's `wait` after submitting its plan now blocks until the lead decides, instead of returning at once and ending the run in reminder loops
 - Plan, rejection, approval and stop notices tell the agent its next step; a member's protocol lists only the pre-approval tools it actually has
 - An idle team lead is no longer woken for every idle or stop notice: those fold into its next turn, and it is woken when the team as a whole goes quiet or a plan needs a decision

@@ -58,6 +58,23 @@ async function tempDir(): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), "omp-teams-"));
 }
 
+/**
+ * Point user-scope discovery at an empty directory so a developer's own
+ * `~/.omp/agent/teams/*.md` files don't leak into discovery assertions.
+ */
+async function withIsolatedUserTeams<T>(run: () => Promise<T>): Promise<T> {
+	const name = `.omp-teams-test-${crypto.randomUUID().slice(0, 8)}`;
+	const previous = process.env.PI_CONFIG_DIR;
+	process.env.PI_CONFIG_DIR = name;
+	try {
+		return await run();
+	} finally {
+		if (previous === undefined) delete process.env.PI_CONFIG_DIR;
+		else process.env.PI_CONFIG_DIR = previous;
+		await fs.rm(path.join(os.homedir(), name), { recursive: true, force: true });
+	}
+}
+
 beforeEach(() => {
 	AgentRegistry.resetGlobalForTests();
 	AgentLifecycleManager.resetGlobalForTests();
@@ -158,16 +175,18 @@ describe("discoverTeams", () => {
 	it("discovers project teams first, first-wins by name across scopes", async () => {
 		const root = await tempDir();
 		try {
-			const project = path.join(root, "proj", ".omp", "teams");
-			await fs.mkdir(project, { recursive: true });
-			await fs.writeFile(
-				path.join(project, "audit.md"),
-				"---\nname: audit\ndescription: project one\nmembers:\n  - agent: scout\n    handle: A\n---\nbody",
-			);
-			const teams = await discoverTeams(path.join(root, "proj"));
-			expect(teams.map(team => team.name)).toEqual(["audit"]);
-			expect(teams[0]?.description).toBe("project one");
-			expect(teams[0]?.source).toBe("project");
+			await withIsolatedUserTeams(async () => {
+				const project = path.join(root, "proj", ".omp", "teams");
+				await fs.mkdir(project, { recursive: true });
+				await fs.writeFile(
+					path.join(project, "audit.md"),
+					"---\nname: audit\ndescription: project one\nmembers:\n  - agent: scout\n    handle: A\n---\nbody",
+				);
+				const teams = await discoverTeams(path.join(root, "proj"));
+				expect(teams.map(team => team.name)).toEqual(["audit"]);
+				expect(teams[0]?.description).toBe("project one");
+				expect(teams[0]?.source).toBe("project");
+			});
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}
@@ -176,7 +195,9 @@ describe("discoverTeams", () => {
 	it("returns an empty list when no team files exist", async () => {
 		const root = await tempDir();
 		try {
-			expect(await discoverTeams(root)).toEqual([]);
+			await withIsolatedUserTeams(async () => {
+				expect(await discoverTeams(root)).toEqual([]);
+			});
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}

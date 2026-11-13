@@ -187,6 +187,27 @@ describe("team:// routing", () => {
 		await expect(router.write("team://audit/tasks/1/claim", "forged owner")).rejects.toThrow();
 	});
 
+	// Regression (live run 2026-11-13): a lead that never started the team got
+	// "Caller is not a member of this team", which reads as a permissions
+	// refusal and sent the agent hunting for docs instead of starting the team.
+	it("names the missing team when the caller leads none", async () => {
+		const router = new InternalUrlRouter();
+		const session = { instanceKey: `no-team:${crypto.randomUUID()}` } as AgentSession;
+		registerLocalSession(session);
+		const tools = {
+			cwd: ".",
+			hasUI: false,
+			getSessionFile: () => null,
+			getSessionInstanceKey: () => session.instanceKey,
+		} as ToolSession;
+		await expect(router.resolve("team://ghost", { session: tools })).rejects.toThrow(
+			'No team "ghost" is running in this session',
+		);
+		await expect(router.write("team://ghost/tasks", "add a task", { session: tools })).rejects.toThrow(
+			/Start one with `\/team start ghost`/,
+		);
+	});
+
 	it("dispatches claims atomically and authorizes completion against the actual caller", async () => {
 		const registry = AgentRegistry.global();
 		const suffix = crypto.randomUUID();

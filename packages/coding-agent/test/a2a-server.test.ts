@@ -112,6 +112,10 @@ class FakeRegistry {
 		const ref = this.#refs.get(id);
 		if (!ref) return false;
 		if (expected !== undefined && ref !== expected) return false;
+		// Production rule (`AgentRegistry.setStatus`): `aborted` is terminal for
+		// its generation, so a late progress/revival update can never make a
+		// canceled ref live again.
+		if (ref.status === "aborted") return status === "aborted";
 		const previousStatus = ref.status;
 		const leftRunning = previousStatus === "running";
 		ref.status = status;
@@ -687,14 +691,18 @@ describe("A2A JSON-RPC methods", () => {
 		expect(asObject(asObject(listed.json, "response").result, "result").tasks as A2aTask[]).toEqual([]);
 	});
 
-	it("preserves a completed task or replacement registered during cancellation", async () => {
-		for (const replace of [false, true]) {
+	it("keeps a completion that landed during cancellation, stamps a settled run aborted", async () => {
+		// The abort and a natural run end race. A published completion is the
+		// honest result and stays COMPLETED; a settled run with no result becomes
+		// CANCELED because `aborted` is the durable terminal marker for the
+		// generation (a queued wake must never flip the task back to WORKING).
+		for (const outcome of ["completed", "settled"] as const) {
 			const registry = new FakeRegistry();
 			const original = registry.register({ id: "worker", displayName: "worker", kind: "sub", status: "running" });
 			original.session = {
 				abort: async () => {
-					if (replace) registry.register({ id: "worker", displayName: "new", kind: "sub", status: "running" });
-					else registry.setStatus("worker", "idle");
+					registry.setStatus("worker", "idle");
+					if (outcome === "completed") original.history = { ...original.history, outputPath: "/tmp/out.md" };
 				},
 			} as never;
 			const { handle } = startServer({ registry, spawn: async () => original });
@@ -704,9 +712,71 @@ describe("A2A JSON-RPC methods", () => {
 				method: "SendMessage",
 				params: { message: { messageId: "m", parts: [{ text: "go" }] } },
 			});
-			await rpc(handle, { jsonrpc: "2.0", id: 2, method: "CancelTask", params: { id: "worker" } });
-			expect(registry.get("worker")?.status).toBe(replace ? "running" : "idle");
+			const canceled = rpcTask(
+				(await rpc(handle, { jsonrpc: "2.0", id: 2, method: "CancelTask", params: { id: "worker" } })).json,
+			);
+			expect(registry.get("worker")?.status).toBe(outcome === "completed" ? "idle" : "aborted");
+			expect(canceled.status.state).toBe(outcome === "completed" ? TASK_STATE.COMPLETED : TASK_STATE.CANCELED);
 		}
+	});
+
+	it("never reports a canceled task WORKING again after a late wake", async () => {
+		// Live 2026-11-13: CancelTask replied CANCELED/FAILED, then a queued
+		// message started a new run and GetTask flipped back to WORKING. The
+		// canceled generation must stay terminal, and A2A delivery to it is
+		// refused like an unknown agent.
+		const registry = new FakeRegistry();
+		const ref = registry.register({ id: "worker", displayName: "worker", kind: "sub", status: "running" });
+		ref.session = { abort: async () => void (ref.status = "idle") } as never;
+		const { handle } = startServer({ registry, spawn: async () => ref });
+		await rpc(handle, {
+			jsonrpc: "2.0",
+			id: 1,
+			method: "SendMessage",
+			params: { message: { messageId: "m", parts: [{ text: "sleep" }] } },
+		});
+		const canceled = rpcTask(
+			(await rpc(handle, { jsonrpc: "2.0", id: 2, method: "CancelTask", params: { id: "worker" } })).json,
+		);
+		expect(canceled.status.state).toBe(TASK_STATE.CANCELED);
+
+		// A queued wake re-runs the agent: the registry refuses the transition.
+		expect(registry.setStatus("worker", "running")).toBe(false);
+		const after = rpcTask(
+			(await rpc(handle, { jsonrpc: "2.0", id: 3, method: "GetTask", params: { id: "worker" } })).json,
+		);
+		expect(after.status.state).toBe(TASK_STATE.CANCELED);
+
+		// And the canceled task no longer accepts deliveries.
+		const refused = await rpc(handle, {
+			jsonrpc: "2.0",
+			id: 4,
+			method: "SendMessage",
+			params: { message: { messageId: "m-2", parts: [{ text: "again" }] }, metadata: { to: "worker" } },
+		});
+		expect(errorResult(refused.json).code).toBe(RPC_ERRORS.TASK_NOT_FOUND);
+	});
+
+	it("preserves a replacement generation registered during cancellation", async () => {
+		let aborted = false;
+		const registry = new FakeRegistry();
+		const original = registry.register({ id: "worker", displayName: "worker", kind: "sub", status: "running" });
+		original.session = {
+			abort: async () => {
+				registry.register({ id: "worker", displayName: "new", kind: "sub", status: "running" });
+				aborted = true;
+			},
+		} as never;
+		const { handle } = startServer({ registry, spawn: async () => original });
+		await rpc(handle, {
+			jsonrpc: "2.0",
+			id: 1,
+			method: "SendMessage",
+			params: { message: { messageId: "m", parts: [{ text: "go" }] } },
+		});
+		await rpc(handle, { jsonrpc: "2.0", id: 2, method: "CancelTask", params: { id: "worker" } });
+		expect(aborted).toBe(true);
+		expect(registry.get("worker")?.status).toBe("running");
 	});
 
 	it("hides advisor transcripts from GetTask", async () => {

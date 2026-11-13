@@ -673,9 +673,18 @@ async function abortOwnedRef(deps: A2aDispatchDeps, ref: AgentRef): Promise<void
 	if (TERMINAL_TASK_STATES.has(mapAgentStatus(ref))) return;
 	await ref.session?.abort({ reason: "a2a CancelTask" });
 	const after = deps.registry.get(ref.id);
-	if (after === ref && !TERMINAL_TASK_STATES.has(mapAgentStatus(after))) {
-		deps.registry.setStatus(ref.id, "aborted", ref);
-	}
+	// A replacement now owns the id: its generation is untouched.
+	if (after !== ref) return;
+	// The run finished with a published result while the abort landed: report the
+	// honest outcome instead of rewriting a completion into a cancel.
+	if (mapAgentStatus(after) === TASK_STATE.COMPLETED) return;
+	// Stamp `aborted` even when the abort settled the run to a terminal idle:
+	// `aborted` is the registry's durable terminal marker for this generation, so
+	// a queued wake can never flip a canceled task back to WORKING and the reply
+	// and later GetTask views agree (live 2026-11-13: CancelTask replied
+	// FAILED, GetTask a second later WORKING because an idle settle skipped the
+	// stamp and a queued message started a new run).
+	deps.registry.setStatus(ref.id, "aborted", ref);
 }
 /**
  * The removal transition shared by the registry `removed` event and a

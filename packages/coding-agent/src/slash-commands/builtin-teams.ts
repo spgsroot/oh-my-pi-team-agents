@@ -182,7 +182,9 @@ export const BUILTIN_TEAMS_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				if (team === undefined) {
 					await runtime.output(
 						teamRuntimeError(
-							`no team named "${teamName}". Discovered: ${teams.map(t => t.name).join(", ") || "none"}`,
+							`no team named "${teamName}". Discovered: ${
+								teams.map(t => t.name).join(", ") || "none"
+							}. Team files live in .omp/teams/${teamName}.md (project) or ~/.omp/agent/teams/${teamName}.md (user).`,
 						),
 					);
 					return commandConsumed();

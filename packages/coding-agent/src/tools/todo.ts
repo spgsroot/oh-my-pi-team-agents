@@ -291,10 +291,54 @@ function resolvePhaseOrError(phases: TodoPhase[], name: string | undefined, erro
 	return phase;
 }
 
+/**
+ * Task text for a freshly created item. The validation layer lossily
+ * stringifies structured items (`{task, description}`) into JSON strings to
+ * satisfy the string-array schema; recover the intended text instead of
+ * storing the encoding as task content (unaddressable `{"task":"…"}` rows).
+ */
+function itemContent(raw: string): string {
+	const trimmed = raw.trim();
+	if (!trimmed.startsWith("{")) return raw;
+	try {
+		const parsed: unknown = JSON.parse(trimmed);
+		if (isRecord(parsed) && typeof parsed.task === "string" && parsed.task.trim()) return parsed.task.trim();
+	} catch {}
+	return raw;
+}
+
 function getTaskTargets(phases: TodoPhase[], entry: TodoOpEntryValue, errors: string[]): TodoItem[] {
 	if (entry.task) {
 		const hit = resolveTaskOrError(phases, entry.task, errors);
 		return hit ? [hit.task] : [];
+	}
+	// Models reuse the init shape to name the tasks a status op applies to
+	// (`done {list:[{phase, items}]}` or `done {phase, items}`). `list` is
+	// documented as init-only but the schema accepts it on every op, so
+	// treating it as absent sent these calls to the "every task" fallback and
+	// completed the whole list. Named items win over the bare-phase form: a
+	// call that lists tasks means those tasks, while `{phase}` alone means the
+	// whole phase.
+	const listed: Array<{ phase?: string; content: string }> = [];
+	for (const listEntry of entry.list ?? []) {
+		for (const rawContent of listEntry.items)
+			listed.push({ phase: listEntry.phase, content: itemContent(rawContent) });
+	}
+	for (const rawContent of entry.items ?? []) listed.push({ phase: entry.phase, content: itemContent(rawContent) });
+	if (listed.length > 0) {
+		const targets: TodoItem[] = [];
+		for (const { phase, content } of listed) {
+			const scope =
+				phase === undefined ? phases.flatMap(candidate => candidate.tasks) : findPhaseByName(phases, phase)?.tasks;
+			if (!scope) {
+				errors.push(`Phase "${phase}" not found`);
+				continue;
+			}
+			const hit = scope.find(task => task.content === content);
+			if (hit) targets.push(hit);
+			else errors.push(`Task "${content}" not found${phase === undefined ? "" : ` in phase "${phase}"`}`);
+		}
+		return targets;
 	}
 	if (entry.phase) {
 		const phase = resolvePhaseOrError(phases, entry.phase, errors);
@@ -330,7 +374,8 @@ function initPhases(entry: TodoOpEntryValue, errors: string[]): TodoPhase[] {
 			errors.push(`Duplicate phase "${listEntry.phase}" in init list`);
 		}
 		seenPhases.add(listEntry.phase);
-		for (const content of listEntry.items) {
+		for (const rawContent of listEntry.items) {
+			const content = itemContent(rawContent);
 			if (seenTasks.has(content)) {
 				errors.push(`Duplicate task "${content}" in init list`);
 			}
@@ -339,7 +384,7 @@ function initPhases(entry: TodoOpEntryValue, errors: string[]): TodoPhase[] {
 	}
 	return list.map(listEntry => ({
 		name: listEntry.phase,
-		tasks: listEntry.items.map<TodoItem>(content => ({ content, status: "pending" })),
+		tasks: listEntry.items.map<TodoItem>(rawContent => ({ content: itemContent(rawContent), status: "pending" })),
 	}));
 }
 
@@ -357,7 +402,8 @@ function appendItems(phases: TodoPhase[], entry: TodoOpEntryValue, errors: strin
 	// duplicate and leaves nothing half-applied.
 	const seen = new Set<string>();
 	let hasDuplicate = false;
-	for (const content of entry.items) {
+	for (const rawContent of entry.items) {
+		const content = itemContent(rawContent);
 		if (seen.has(content) || findTaskByContent(phases, content)) {
 			errors.push(`Task "${content}" already exists`);
 			hasDuplicate = true;
@@ -372,8 +418,8 @@ function appendItems(phases: TodoPhase[], entry: TodoOpEntryValue, errors: strin
 		phases.push(phase);
 	}
 
-	for (const content of entry.items) {
-		phase.tasks.push({ content, status: "pending" });
+	for (const rawContent of entry.items) {
+		phase.tasks.push({ content: itemContent(rawContent), status: "pending" });
 	}
 	return phases;
 }
@@ -383,6 +429,15 @@ function removeTasks(phases: TodoPhase[], entry: TodoOpEntryValue, errors: strin
 		const hit = resolveTaskOrError(phases, entry.task, errors);
 		if (!hit) return phases;
 		hit.phase.tasks = hit.phase.tasks.filter(candidate => candidate !== hit.task);
+		return phases;
+	}
+	// Same init-shape targeting as `done`: `rm {list|items}` must remove only
+	// the named tasks, never fall through to clearing the whole list (or the
+	// whole phase when items are listed alongside it).
+	if ((entry.list?.length ?? 0) > 0 || (entry.items?.length ?? 0) > 0) {
+		for (const task of getTaskTargets(phases, entry, errors)) {
+			for (const phase of phases) phase.tasks = phase.tasks.filter(candidate => candidate !== task);
+		}
 		return phases;
 	}
 	if (entry.phase) {

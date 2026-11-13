@@ -52,6 +52,29 @@ describe("agent team prompts", () => {
 		expect(agent?.teamSystemPrompt).toBeUndefined();
 	});
 
+	// Regression (live run 2026-11-13): user-level overrides of bundled agents
+	// (a copied scout.md/reviewer.md for prompt tweaks) shadow the bundled
+	// definition and used to drop its team-prompt silently, so `/team start`
+	// refused with "member Scout (scout) is read-only and has no team prompt".
+	test("an override without its own team prompt inherits the bundled one", async () => {
+		const { root, agents } = fixture();
+		fs.writeFileSync(path.join(agents, "scout.md"), "---\nname: scout\ndescription: Override\n---\nCustom.\n");
+		const agent = (await discoverAgents(root, root)).agents.find(candidate => candidate.name === "scout");
+		expect(agent?.systemPrompt.trim()).toBe("Custom.");
+		expect(agent?.teamSystemPrompt).toBe(getBundledAgent("scout")?.teamSystemPrompt);
+	});
+
+	test("an explicit team:false override never inherits the bundled team prompt", async () => {
+		const { root, agents } = fixture();
+		fs.writeFileSync(
+			path.join(agents, "scout.md"),
+			"---\nname: scout\ndescription: Override\nteam: false\n---\nCustom.\n",
+		);
+		const agent = (await discoverAgents(root, root)).agents.find(candidate => candidate.name === "scout");
+		expect(agent?.team).toBe(false);
+		expect(agent?.teamSystemPrompt).toBeUndefined();
+	});
+
 	test.each(["scout", "reviewer"])("bundles a distinct team prompt for %s", name => {
 		const agent = getBundledAgent(name);
 		expect(agent?.teamSystemPrompt).toBeTruthy();
