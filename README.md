@@ -53,6 +53,15 @@ Wire contract and settings: [docs/a2a.md](docs/a2a.md).
 
 A team file declares members, handles, a shared workspace and the protocol they follow. `/team start <name>` spawns every member as a full subagent with a stable handle; members message each other directly with `agent://<handle>` and coordinate through `TASKS.md`.
 
+Team files are discovered from two scopes; on a name collision the project file wins:
+
+- **Project team:** `<project>/.omp/teams/<name>.md` — lives with the repository and is shared by everyone who clones it;
+- **User team:** `~/.omp/agent/teams/<name>.md` — available in every project (with an active profile: `~/.omp/profiles/<profile>/agent/teams/<name>.md`).
+
+Enable once with `team.enabled: true`, create the file, then run `/team start <name> [assignment]`. `/team list` shows every discovered team.
+
+`.omp/teams/review.md`:
+
 ```markdown
 ---
 name: review
