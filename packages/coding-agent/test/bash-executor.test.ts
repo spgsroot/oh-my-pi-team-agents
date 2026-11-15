@@ -1463,6 +1463,39 @@ exit 64
 		expect(nativeSignal?.aborted).toBe(false);
 		expect(abortSpy).not.toHaveBeenCalled();
 	});
+
+	it("keeps the command result when every trace snapshot poll fails", async () => {
+		// Regression for the fatal uncaught "Native shell returned an invalid
+		// execution trace": poll failures inside pollRunTrace's setInterval
+		// callback must degrade the preview only, never the session.
+		let calls = 0;
+		vi.spyOn(piNatives.RunTrace.prototype, "snapshot").mockImplementation(() => {
+			calls++;
+			// Valid script text but a garbage journal: rejected by the wire guard.
+			return JSON.stringify({
+				v: 1,
+				seq: calls,
+				t_ns: 0,
+				script: "printf 'survives\\n'",
+				units: [{ line: 1, nodes: [{ k: "simple", lo: 0, hi: 19, state: "ok" }] }],
+				history: [{ seq: 1, t_ns: 0, kind: "Assign", name: "x", value: { bad: true } }],
+			});
+		});
+		const traces: unknown[] = [];
+		const result = await executeBash("printf 'survives\\n'", {
+			cwd: tempDir,
+			timeout: 5000,
+			onTrace: trace => {
+				traces.push(trace);
+			},
+		});
+		expect(calls).toBeGreaterThan(0);
+		expect(traces).toEqual([]);
+		expect(result.exitCode).toBe(0);
+		expect(result.cancelled).toBe(false);
+		expect(result.output).toContain("survives");
+		expect(result.trace).toBeUndefined();
+	});
 });
 
 describe("executeBash :async: background retention", () => {

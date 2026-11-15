@@ -1,5 +1,11 @@
 import { RunTrace } from "@oh-my-pi/pi-natives";
-import { isShellTrace, type ShellTrace, type ShellVizPreferences, type ShellVizPresentation } from "@oh-my-pi/pi-wire";
+import {
+	isShellTrace,
+	type ShellTrace,
+	type ShellTraceText,
+	type ShellVizPreferences,
+	type ShellVizPresentation,
+} from "@oh-my-pi/pi-wire";
 import { defaultShellVizPreferences, readShellPresentation, shellVisualization } from "../tools/shell-viz";
 import { changeShellVizPreferences, shellVizEventAction } from "../tools/shell-trace";
 import { ShellVisualizer } from "../apps/shell-visualizer";
@@ -397,7 +403,7 @@ let toolExecutionInstanceSeq = 0;
 export class ToolExecutionComponent extends Container {
 	#shellPreferences: ShellVizPreferences = defaultShellVizPreferences();
 	#shellPendingTrace: RunTrace | undefined;
-	#shellPendingScript: string | undefined;
+	#shellPendingScript: ShellTraceText | undefined;
 	#shellPresentation: ShellVizPresentation | undefined;
 	#shellPresentationKey: string | undefined;
 	#shellTrace: ShellTrace | undefined;
@@ -654,7 +660,9 @@ export class ToolExecutionComponent extends Container {
 		if (this.#shellPresentation && key === this.#shellPresentationKey) return this.#shellPresentation;
 		const source = this.#shellTrace
 			? shellVisualization(this.#shellTrace)
-			: (this.#shellPendingTrace ??= new RunTrace(script));
+			: (this.#shellPendingTrace ??= new RunTrace(
+					typeof script === "string" ? script : new TextDecoder("utf-8").decode(Uint8Array.from(script)),
+				));
 		this.#shellPresentation = readShellPresentation(
 			source,
 			this.#shellPreferences,

@@ -6,8 +6,11 @@
 
 - Added the `ShellTrace` model (`shell-trace.ts`: a shell run's compiled units, per-node state and reflowed layout, byte-offset based) and the TSP `shell` kind with `TspShellProps`
 
-## [18.16.0] - 2026-11-02
+### Fixed
 
+- Fixed `isShellTrace` rejecting native traces whose truncated byte strings (e.g. a variable value cut mid multi-byte character) serialize as `number[]` raw bytes instead of text: byte-string fields now accept the engine's text-or-bytes form (`ShellTraceText`), so a trace poll no longer throws on non-UTF-8 data
+
+## [18.16.0] - 2026-11-02
 ### Added
 
 - Added the collab envelope helpers `packEnvelope`, `unpackEnvelope` and `rewriteEnvelopePeer`

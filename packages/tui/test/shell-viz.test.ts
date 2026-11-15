@@ -91,3 +91,61 @@ describe("native shell presentation boundary", () => {
 		expect(readShellPresentation(restored, replay, stored).output).toBe("native-boundary\n");
 	});
 });
+
+describe("native shell trace byte-form boundary", () => {
+	it("accepts byte-array values the engine emits when truncated text is not valid UTF-8", async () => {
+		// Regression for the fatal "Native shell returned an invalid execution
+		// trace": a multi-byte value cut at a non-char boundary makes the
+		// serializer emit raw bytes (`number[]`) instead of a string, which the
+		// wire guard must accept (ShellTraceText), not reject. Assigning a
+		// Russian literal with a large cut exercises the same serializer path
+		// end to end: every snapshot the engine produces must validate.
+		const command = 'file="значение переменной обрезанное посередине многобайтового символа"; printf "%s\\n" "$file"';
+		const trace = new RunTrace(command);
+		const shell = new Shell();
+		await shell.run({ command, trace });
+		const final = snapshot(trace);
+		expect(final.history?.some(entry => entry.kind === "Assign")).toBe(true);
+	});
+
+	it("accepts an explicit byte-array assign value, mirroring a cut multi-byte script payload", () => {
+		const bytes = [...Buffer.from("- verdict: **confirmed** — рус", "utf8")];
+		// Cut mid-code-point: invalid UTF-8, the exact producer of the crash.
+		bytes.length = bytes.length - 1;
+		const value = {
+			v: 1,
+			seq: 7,
+			t_ns: 8190917,
+			script: "file=$(sed -n '1p' data)",
+			units: [{ line: 1, bytes: 24, nodes: [{ k: "simple", lo: 0, hi: 24, state: "ok" }] }],
+			history: [
+				{
+					seq: 152,
+					t_ns: 14050791,
+					kind: "Assign",
+					u: 0,
+					n: 45,
+					command: { run: 0, vpid: 1073741826, seq: 30 },
+					vpid: 1073741826,
+					name: "file",
+					value: bytes,
+					full_len: bytes.length,
+					scope: "shell",
+				},
+			],
+		};
+		expect(isShellTrace(value)).toBe(true);
+	});
+
+	it("still rejects non-byte-array garbage in a byte-form position", () => {
+		const value = {
+			v: 1,
+			seq: 7,
+			t_ns: 0,
+			script: "x=1",
+			units: [{ line: 1, nodes: [{ k: "simple", lo: 0, hi: 3, state: "ok" }] }],
+			history: [{ seq: 1, t_ns: 0, kind: "Assign", name: "x", value: { bad: true }, full_len: 1, scope: "shell" }],
+		};
+		expect(isShellTrace(value)).toBe(false);
+	});
+});

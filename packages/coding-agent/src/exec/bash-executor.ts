@@ -15,6 +15,7 @@ import {
 	type ShellRunResult,
 } from "@oh-my-pi/pi-natives";
 import { isShellTrace, type ShellTrace } from "@oh-my-pi/pi-wire";
+import { logger } from "@oh-my-pi/pi-utils";
 import { $env } from "@oh-my-pi/pi-utils/env";
 import { isCmdShell, isExecutable, type ShellConfig } from "@oh-my-pi/pi-utils/procmgr";
 import { Settings } from "../config/settings";
@@ -163,19 +164,43 @@ const TRACE_POLL_MS = 80;
 /**
  * Polls `trace` every {@link TRACE_POLL_MS} while the run is in flight and
  * forwards each changed snapshot; `stop()` takes the final one.
+ *
+ * A poll failure (native serialization drift, a snapshot the wire guard
+ * rejects) is contained here: it logs, skips the tick, and keeps the last
+ * valid snapshot. The command itself still runs and returns; a broken
+ * preview must not kill the session from inside a `setInterval` callback.
  */
 function pollRunTrace(trace: RunTrace, onTrace: (trace: ShellTrace) => void): { stop: () => ShellTrace | undefined } {
 	let last = -1;
 	let latest: ShellTrace | undefined;
+	let failed = 0;
 	const poll = () => {
 		const version = trace.version();
 		if (version === last) return;
-		const snapshot: unknown = JSON.parse(trace.snapshot());
-		if (!isShellTrace(snapshot)) throw new Error("Native shell returned an invalid execution trace");
+		let snapshot: unknown;
+		try {
+			snapshot = JSON.parse(trace.snapshot());
+		} catch (err) {
+			logPollFailure(err);
+			return;
+		}
+		if (!isShellTrace(snapshot)) {
+			logPollFailure(new Error("Native shell returned an invalid execution trace"));
+			return;
+		}
 		last = version;
 		latest = snapshot;
+		failed = 0;
 		attachShellTrace(latest, trace);
 		onTrace(latest);
+	};
+	const logPollFailure = (err: unknown) => {
+		// A run whose snapshots keep failing would spam the log every 80 ms;
+		// report the first failure and every 100th after that.
+		if (++failed % 100 !== 1) return;
+		logger.warn("shell trace poll failed; keeping the last valid snapshot", {
+			error: err instanceof Error ? err.message : String(err),
+		});
 	};
 	const timer = setInterval(poll, TRACE_POLL_MS);
 	return {

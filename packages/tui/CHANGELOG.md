@@ -33,6 +33,7 @@
 
 ### Fixed
 - The `find` card marks a search its 20 s budget cut short (`timed out, V/P passages verified`), so its hits are not read as a complete result ([#18161](https://github.com/can1357/oh-my-pi/pull/18161) by [@will-bogusz](https://github.com/will-bogusz))
+- A bash block whose trace snapshot arrives in the wire byte form (a truncated non-UTF-8 value) still builds its pending shell visualization: the script text is lossy-decoded instead of being passed to the native `RunTrace` as a byte array, and the trace itself validates against the widened text-or-bytes guard
 - Tern's classic renderer draws inline images (table charts included) as Kitty Unicode placeholders, so text that replaces an image's cells removes the image instead of leaving a stale copy over the table while an answer streams or the pane resizes
 - The native composer's first frame shows the cached thinking level on the model chip (or effort chip) instead of the plain model icon until the session attaches
 - Clicking the popup of an enum setting with many values (Edit Mode, Session Tree Filter, Advisor Sync Backlog) on a native settings page opens its menu instead of doing nothing

@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Added
+
+### Fixed
+
+- Fixed the fatal uncaught `Native shell returned an invalid execution trace` that killed whole sessions: a failed shell-trace poll (snapshot parse or wire-guard rejection) now logs a warning, keeps the last valid preview, and never aborts the session from inside the poll timer; the command still runs and returns normally
 - A team lead agent can decide a member's plan itself with `write team://<team>/plan/<member>` (`approve [--rev N]` or `reject [--rev N]: <reason>`), the same authority as `/team approve|reject`
 - `/team start` gives the lead a hidden protocol note for its next turn (roster, the members' instructions, channels, how to decide plans) and warns when a member's instructions name a tool its agent cannot call in the session
 - `read team://<team>` shows the team at a glance — roster, live status, and each gated member's plan with its revision — and an invalid `team://` path is refused with the list of valid ones
