@@ -21,6 +21,7 @@ describe("classifyToolCall", () => {
 			"coordination",
 		);
 		expect(classifyToolCall("write", { path: "team://audit/tasks/3/done", content: "ok" })).toBe("coordination");
+		expect(classifyToolCall("read", { path: "team://audit" })).toBe("coordination");
 		expect(classifyToolCall("write", { path: "agent://Scout", content: "next task" })).toBe("coordination");
 		expect(classifyToolCall("wait", {})).toBe("coordination");
 		expect(classifyToolCall("task", { tasks: [{ agent: "a2a:peer", task: "hi" }] })).toBe("coordination");

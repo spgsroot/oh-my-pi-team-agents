@@ -40,9 +40,9 @@ const DISCOVERY_PATTERNS: readonly RegExp[] = [
 
 const COORDINATION_TOOLS = new Set(["wait", "yield", "handback"]);
 
-/** The `team://` paths the protocol serves; anything else is a guess. */
+/** The `team://` paths the protocol serves (the team overview included); anything else is a guess. */
 const TEAM_PATH =
-	/^team:\/\/[^/?#]+\/(?:tasks(?:\/[1-9][0-9]*\/(?:claim|release|done))?|plan(?:\/[A-Za-z0-9_-]+)?|stop\/[A-Za-z0-9_-]+)$/;
+	/^team:\/\/[^/?#]+(?:\/(?:tasks(?:\/[1-9][0-9]*\/(?:claim|release|done))?|plan(?:\/[A-Za-z0-9_-]+)?|stop\/[A-Za-z0-9_-]+))?$/;
 
 /** Classify one assistant tool call by its name and arguments. */
 export function classifyToolCall(name: string, args: unknown): ToolCallKind {
