@@ -79,7 +79,7 @@ Optional fields:
 | `planApproval` | YAML boolean requiring approval for all members when `true`; omitted means no requirement. |
 | Member `planApproval` | YAML boolean overriding the team value, including explicit `false`. Invalid boolean values cause the team file to be skipped. |
 | Member `model` | Optional model selector for that member. Without it, a member whose agent definition has no model of its own (and is not pinned to the `@task` role) uses the lead's active model. An empty value causes the team file to be skipped. |
-| Member `thinking-level` | Optional thinking level for that member (any CLI thinking level, e.g. `high`). Without it, the agent definition's own level applies, else the lead's. |
+| Member `thinking-level` | Optional thinking level for that member (any CLI thinking level, e.g. `high`). Without it, the agent definition's own level applies, else the lead's. An unknown value causes the team file to be skipped. |
 
 Handles use the registry's `sanitizeAgentId` normalization, including its
 48-character cap. Handles that collide after normalization within the selected

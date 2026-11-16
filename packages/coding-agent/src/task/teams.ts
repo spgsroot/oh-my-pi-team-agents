@@ -96,7 +96,8 @@ export function parseTeamFile(contents: string, filePath: string): TeamDefinitio
 			logger.warn(`team file ${filePath}: member model must be a non-empty selector; skipped team`);
 			return undefined;
 		}
-		if ("thinking-level" in record && !CLI_THINKING_LEVELS.some(level => level === record["thinking-level"])) {
+		// parseFrontmatter camelCases kebab-case keys, so `thinking-level` arrives as `thinkingLevel`.
+		if ("thinkingLevel" in record && !CLI_THINKING_LEVELS.some(level => level === record.thinkingLevel)) {
 			logger.warn(`team file ${filePath}: invalid member thinking-level; skipped team`);
 			return undefined;
 		}
@@ -106,8 +107,8 @@ export function parseTeamFile(contents: string, filePath: string): TeamDefinitio
 			...(typeof record.role === "string" && record.role.trim().length > 0 ? { role: record.role.trim() } : {}),
 			...(typeof record.planApproval === "boolean" ? { planApproval: record.planApproval } : {}),
 			...(typeof record.model === "string" ? { model: record.model.trim() } : {}),
-			...(typeof record["thinking-level"] === "string"
-				? { thinkingLevel: record["thinking-level"] as ConfiguredThinkingLevel }
+			...(typeof record.thinkingLevel === "string"
+				? { thinkingLevel: record.thinkingLevel as ConfiguredThinkingLevel }
 				: {}),
 		});
 	}

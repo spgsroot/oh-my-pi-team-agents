@@ -130,6 +130,22 @@ describe("parseTeamFile", () => {
 		expect(ordinary?.members[0]?.planApproval).toBeUndefined();
 	});
 
+	it("parses member model and thinking-level and skips a team with an invalid value", () => {
+		const withOverrides = TEAM_YAML.replace(
+			"    handle: Scout",
+			'    handle: Scout\n    model: "anthropic/claude-sonnet-5"\n    thinking-level: high',
+		);
+		const team = parseTeamFile(withOverrides, "/tmp/audit.md");
+		expect(team?.members[0]).toMatchObject({ model: "anthropic/claude-sonnet-5", thinkingLevel: "high" });
+		expect(team?.members[1]?.model).toBeUndefined();
+		expect(team?.members[1]?.thinkingLevel).toBeUndefined();
+
+		const bad = TEAM_YAML.replace("    handle: Scout", "    handle: Scout\n    thinking-level: bogus");
+		expect(parseTeamFile(bad, "/tmp/audit.md")).toBeUndefined();
+		const emptyModel = TEAM_YAML.replace("    handle: Scout", '    handle: Scout\n    model: ""');
+		expect(parseTeamFile(emptyModel, "/tmp/audit.md")).toBeUndefined();
+	});
+
 	it("rejects nonboolean approval settings rather than silently starting an ungated member", () => {
 		for (const value of ['"true"', '"false"', "null", "1", "[]", "{}"]) {
 			expect(

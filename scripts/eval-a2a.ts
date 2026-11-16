@@ -13,6 +13,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Process } from "@oh-my-pi/pi-natives";
 
 const repoRoot = path.join(import.meta.dir, "..");
 const cli = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
@@ -123,6 +124,8 @@ function launch(name: string, project: string, config: string, model: string): T
 			return next(frame => frame.type === "response" && frame.id === id, 60_000);
 		},
 		stop: async () => {
+			// omp's persistent shell/session children keep the project directory as cwd; kill the whole tree.
+			Process.fromPid(child.pid)?.killTree(9);
 			child.kill();
 			await child.exited;
 		},

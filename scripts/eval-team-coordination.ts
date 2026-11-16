@@ -12,6 +12,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Process } from "@oh-my-pi/pi-natives";
 import { discoveryShare, measureEntries, type OverheadCounts } from "./team-coordination-overhead";
 
 const repoRoot = path.join(import.meta.dir, "..");
@@ -145,6 +146,7 @@ async function main(): Promise<number> {
 		const sessionFile = (await request({ type: "get_state" }))?.data?.sessionFile;
 		(child.stdin as import("bun").FileSink).end();
 		await Promise.race([child.exited, Bun.sleep(30_000)]);
+		Process.fromPid(child.pid)?.killTree(9);
 		child.kill();
 
 		const total: OverheadCounts = { discovery: 0, coordination: 0, work: 0, reminders: 0 };
@@ -160,6 +162,7 @@ async function main(): Promise<number> {
 		);
 		return landed && share <= options.maxShare ? 0 : 1;
 	} finally {
+		Process.fromPid(child.pid)?.killTree(9);
 		child.kill();
 		await child.exited;
 		if (!options.keep) {

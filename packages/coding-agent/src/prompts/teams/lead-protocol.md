@@ -9,7 +9,7 @@ Every member received these instructions:
 Assignment from `/team start`: {{assignment}}
 {{/if}}
 
-State at start: every member above was just spawned and is working or starting; the task ledger is empty{{#if anyPlanApproval}} and no plan is submitted yet{{/if}}. Tasks, plans and statuses change only through your writes and team notices, so read `team://{{team}}` and its `/tasks` only to check state after a notice; reading them now returns nothing new.
+Plans, task claims and member statuses change only through your writes and team notices, so `read team://{{team}}` after a notice rather than polling it. A member that failed to start is reported to you by the start command, not by this note.
 
 - `read team://{{team}}` shows the roster, each member's status, and its current plan with revision.
 - Message a member: `write agent://<id>`. Wait for a reply you asked for with `wait`.
