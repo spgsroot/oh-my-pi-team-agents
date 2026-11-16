@@ -712,6 +712,35 @@ describe("/team start and stop", () => {
 		}
 	});
 
+	it("shows the lead the real task ledger at start: seeded titles, or empty", async () => {
+		for (const tasks of [["Collect logs", "Write report"], undefined]) {
+			const { team, root, cleanup } = await teamFixture({ handles: ["Scout"] });
+			try {
+				mockTeamDiscovery({ ...team, ...(tasks ? { tasks } : {}) });
+				vi.spyOn(spawnSubagent, "spawnSubagentForSession").mockResolvedValue({ id: "Scout" } as never);
+				const toolSession = {
+					getArtifactsDir: () => null,
+					settings: Settings.isolated({}),
+					cwd: root,
+					hasUI: false,
+				};
+				const { runtime, leadContext } = teamRuntime(root, toolSession);
+				await TEAM_HANDLE({ args: "start audit" }, runtime);
+				const content = leadContext[0]!.message.content;
+				if (tasks) {
+					expect(content).toContain("`1` Collect logs (open)");
+					expect(content).toContain("`2` Write report (open)");
+					expect(content).not.toContain("empty");
+				} else {
+					expect(content).toContain("Task ledger at start: empty.");
+				}
+			} finally {
+				await cleanup();
+				vi.restoreAllMocks();
+			}
+		}
+	});
+
 	it("stop releases only the recorded member id, leaving an unrelated same-handle ref running", async () => {
 		const { team, root, cleanup } = await teamFixture({ handles: ["Scout"] });
 		try {

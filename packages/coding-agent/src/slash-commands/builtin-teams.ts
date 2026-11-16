@@ -451,6 +451,10 @@ export const BUILTIN_TEAMS_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 						role: member.role,
 						planApproval: member.planApproval ?? team.planApproval === true,
 					}));
+					// The ledger as it stands now (seeded titles or a prior run's tasks), so the lead
+					// does not spend a read to learn what the start command already knows.
+					const leadIdentity = await client.leadIdentity(key, team.name).catch(() => undefined);
+					const tasks = leadIdentity ? await client.readTasks(key, leadIdentity).catch(() => []) : [];
 					await runtime.session.sendCustomMessage(
 						{
 							customType: "team-lead-protocol",
@@ -461,6 +465,7 @@ export const BUILTIN_TEAMS_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 									members: roster,
 									anyPlanApproval: roster.some(member => member.planApproval),
 									instructions: team.body.trim(),
+									tasks,
 									assignment,
 								})
 								.trim(),

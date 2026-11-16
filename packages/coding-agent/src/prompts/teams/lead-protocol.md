@@ -9,7 +9,13 @@ Every member received these instructions:
 Assignment from `/team start`: {{assignment}}
 {{/if}}
 
-Plans, task claims and member statuses change only through your writes and team notices, so `read team://{{team}}` after a notice rather than polling it. A member that failed to start is reported to you by the start command, not by this note.
+Task ledger at start:{{#if tasks.length}}
+{{#each tasks}}
+- `{{id}}` {{title}} ({{status}}{{#if owner}}, {{owner}}{{/if}})
+{{/each}}
+{{else}} empty.
+{{/if}}
+Plans, task claims and member statuses change only through your writes and team notices, so read `team://{{team}}` or its `/tasks` again only after a notice, not to poll.
 
 - `read team://{{team}}` shows the roster, each member's status, and its current plan with revision.
 - Message a member: `write agent://<id>`. Wait for a reply you asked for with `wait`.
