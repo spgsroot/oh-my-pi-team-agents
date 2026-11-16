@@ -96,7 +96,7 @@ export async function executeSend(
 		text =
 			targets.length === 0
 				? "No live peers to broadcast to."
-				: `Broadcast delivered to ${delivered.length} of ${targets.length} peer(s).`;
+				: `Broadcast accepted for ${delivered.length} of ${targets.length} peer(s).`;
 		if (receipts.length) {
 			text += `\n${receipts
 				.map(receipt =>
@@ -115,7 +115,9 @@ export async function executeSend(
 				? `Failed: ${to} ${unavailable ? "is not running" : "could not receive the message"}. ${receipt.error ?? ""}`.trimEnd()
 				: receipt.outcome === "revived"
 					? `Queued for ${to} (was parked; revived).`
-					: `Delivered to ${to}.`;
+					: receipt.outcome === "queued"
+						? `Queued for ${to}; not yet delivered to the session. Do not resend.`
+						: `Delivered to ${to}.`;
 	}
 	return {
 		content: [{ type: "text", text }],

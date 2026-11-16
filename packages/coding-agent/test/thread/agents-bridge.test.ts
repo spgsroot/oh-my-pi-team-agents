@@ -214,6 +214,28 @@ describe("agent bridging across subagent workers", () => {
 		);
 	});
 
+	it("never buffers a worker mailbox delivery refused for queue overflow", async () => {
+		const { probe } = await startWorker();
+		await probe.open("W1", { gated: true });
+		const remote = mirrorOf(liveRef("W1").session);
+		const prompting = remote.prompt("hold the turn");
+		await waitFor(() => remote.isStreaming);
+		const bus = new IrcBus(AgentRegistry.global(), undefined, {
+			settings: Settings.isolated({ "irc.ingressGuard": false }),
+		});
+		try {
+			for (let index = 0; index < 50; index++) {
+				expect((await bus.send({ from: "Main", to: "W1", body: `queued-${index}` })).outcome).toBe("injected");
+			}
+			const refused = await bus.send({ from: "Main", to: "W1", body: "overflow" });
+			expect(refused).toMatchObject({ outcome: "failed", error: "recipient queue full" });
+			expect(bus.take("W1")).toBeUndefined();
+		} finally {
+			await probe.openGate();
+			await prompting;
+		}
+	});
+
 	it("detaches refs and rejects in-flight commands when the worker dies", async () => {
 		const { worker, probe } = await startWorker();
 		await probe.open("Parked", { sessionFile: "/tmp/agents-bridge-parked.jsonl", gated: true });

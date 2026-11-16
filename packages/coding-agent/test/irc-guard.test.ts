@@ -511,6 +511,41 @@ describe("IrcBus ingress guard", () => {
 		expect((await bus.send({ from: "0-Worker", to: "0-Sink", body: "two".padEnd(40, "x") })).outcome).toBe("failed");
 	});
 
+	it("allows an identical retry after a full recipient queue is drained", async () => {
+		const bus = makeBus({ "irc.rateLimitTokens": 0 });
+		const { sink } = registerPeers();
+		const bridge = new IrcBridge(makeBridgeHost());
+		Object.assign(sink.session, { deliverIrcMessage: (msg: IrcMessage) => bridge.deliver(msg) });
+		for (let index = 0; index < 50; index++) {
+			await bus.send({ from: "0-Sender", to: "0-Sink", body: `queued-${index}` });
+		}
+		const message = { from: "0-Sender", to: "0-Sink", body: "retry me" };
+		expect(await bus.send(message)).toMatchObject({ outcome: "failed", error: "recipient queue full" });
+		bridge.drainPending();
+		expect((await bus.send(message)).outcome).toBe("injected");
+		const drained = bridge.drainPending();
+		expect(drained.map(record => ("details" in record ? record.details : undefined))).toEqual([
+			expect.objectContaining({ message: "retry me" }),
+		]);
+		expect((await bus.send(message)).error).toContain("duplicate");
+	});
+
+	it("keeps the dedup reservation when a failed hand-off was buffered for later delivery", async () => {
+		const bus = makeBus({ "irc.rateLimitTokens": 0 });
+		const { sink } = registerPeers();
+		Object.assign(sink.session, {
+			deliverIrcMessage: async () => {
+				throw new Error("session busy");
+			},
+		});
+		const message = { from: "0-Sender", to: "0-Sink", body: "buffered once" };
+		expect(await bus.send(message)).toEqual({ to: "0-Sink", outcome: "queued" });
+		expect((await bus.send(message)).error).toContain("duplicate");
+		expect(bus.unreadCount("0-Sink")).toBe(1);
+		expect(bus.take("0-Sink")).toMatchObject(message);
+		expect(bus.take("0-Sink")).toBeUndefined();
+	});
+
 	it("returns a failed receipt for the 51st send to a full recipient queue and keeps the earlier records", async () => {
 		const bus = makeBus({ "irc.ingressGuard": false });
 		const { sink } = registerPeers();

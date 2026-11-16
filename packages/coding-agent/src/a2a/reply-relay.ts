@@ -183,7 +183,7 @@ function normalizedUrl(url: string): string {
  * arbitrary. Duplicate registrations of the same `(url, skillId)` endpoint
  * collapse to one candidate (the bridge keeps one entry per endpoint).
  */
-function findPeer(bridge: A2aBridgeApi, request: A2aIncomingRequest): A2aRuntimeAgent | undefined {
+export function findPeer(bridge: A2aBridgeApi, request: A2aIncomingRequest): A2aRuntimeAgent | undefined {
 	let candidates = bridge.list().filter(agent => agent.skillId === request.from);
 	if (request.fromUrl !== undefined) {
 		const wanted = normalizedUrl(request.fromUrl);

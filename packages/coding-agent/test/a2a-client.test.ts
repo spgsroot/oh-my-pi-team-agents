@@ -2250,6 +2250,33 @@ describe("addressed A2A reply jobs", () => {
 		expect(bus).toHaveLength(1);
 	});
 
+	it("correlates an explicit reply with the selected endpoint, not its shared skill name", async () => {
+		const first = mockA2a({ onRpc: () => rpcResult(1, { task: deliveryTask() }) });
+		const second = mockA2a({ onRpc: () => rpcResult(1, { task: deliveryTask() }) });
+		const { bridge } = await registerFrom(first);
+		await addA2aAgentsFromUrl({ bridge, url: second.url, agentDir: await tempDir() });
+		const peer = bridge.list().find(agent => agent.url === second.url && agent.skillId === "main")!;
+		await IncomingRequests.global().note({
+			from: "main",
+			fromUrl: first.url,
+			messageId: "request-a",
+			to: OWNER,
+			at: 1,
+		});
+		await IncomingRequests.global().note({
+			from: "main",
+			fromUrl: second.url,
+			messageId: "request-b",
+			to: OWNER,
+			at: 2,
+		});
+		const tool = await createTaskTool(bridge, Settings.isolated(), { agentId: OWNER, asyncJobManager: managerFor() });
+		await tool.execute("endpoint-reply", { agent: peer.name, task: "answer for B" } as TaskParams);
+		expect(second.calls[0]?.params.metadata).toMatchObject({ inReplyTo: "request-b" });
+		expect(first.calls).toEqual([]);
+		expect((await IncomingRequests.global().list(OWNER)).map(request => request.messageId)).toEqual(["request-a"]);
+	});
+
 	it("does not open a reply job for an outbound reply or an a2aSpawn", async () => {
 		const server = mockA2a({
 			onRpc: call =>

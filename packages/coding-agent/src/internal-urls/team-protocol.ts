@@ -152,8 +152,9 @@ export class TeamProtocolHandler implements ProtocolHandler {
 		if (!member) throw new Error(`No member "${target.handle}" in team ${target.team}`);
 		const decision = parseDecision(content);
 		const handle = member[0];
-		if (decision.verdict === "approve") await client.approve(key, handle, decision.revision);
-		else await client.reject(key, handle, decision.reason, decision.revision);
+		const identity = { team: target.team, generation: roster.generation, memberId: member[1].id };
+		if (decision.verdict === "approve") await client.approve(key, handle, decision.revision, identity);
+		else await client.reject(key, handle, decision.reason, decision.revision, identity);
 		const result = {
 			decision: decision.verdict === "approve" ? "approved" : "rejected",
 			member: member[1].id,

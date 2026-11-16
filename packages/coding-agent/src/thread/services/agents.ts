@@ -22,6 +22,7 @@
  */
 import { logger } from "@oh-my-pi/pi-utils";
 import { IrcBus } from "../../irc/bus";
+import { IrcQueueFullError } from "../../irc/errors";
 import { type AdoptOptions, type AgentReviver, AgentLifecycleManager } from "../../registry/agent-lifecycle";
 import { AgentRegistry, type RegistryListener } from "../../registry/agent-registry";
 import { PromptDroppedError, SessionBusyError } from "../../session/agent-session";
@@ -65,6 +66,7 @@ export interface AgentsThreadGlobals {
 function registerSessionErrors(): void {
 	registerRpcError("PromptDroppedError", message => Object.assign(new PromptDroppedError(), { message }));
 	registerRpcError("SessionBusyError", message => Object.assign(new SessionBusyError("continue"), { message }));
+	registerRpcError("IrcQueueFullError", () => new IrcQueueFullError());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

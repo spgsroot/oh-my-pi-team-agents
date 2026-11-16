@@ -24,8 +24,9 @@ const serve: RpcServe<TeamEndpoint, TeamProtocol> = {
 	memberIdentity: (endpoint, key, team, generation, handle) => endpoint.memberIdentity(key, team, generation, handle),
 	planPending: (endpoint, key, identity) => endpoint.planPending(key, identity),
 	submitPlan: (endpoint, key, identity, text) => endpoint.submitPlan(key, identity, text),
-	approve: (endpoint, key, handle, revision) => endpoint.approve(key, handle, revision),
-	reject: (endpoint, key, handle, reason, revision) => endpoint.reject(key, handle, reason, revision),
+	approve: (endpoint, key, handle, revision, identity) => endpoint.approve(key, handle, revision, identity),
+	reject: (endpoint, key, handle, reason, revision, identity) =>
+		endpoint.reject(key, handle, reason, revision, identity),
 	respondStop: (endpoint, key, identity, requestId, body) => endpoint.respondStop(key, identity, requestId, body),
 	overview: (endpoint, key, identity) => endpoint.overview(key, identity),
 	readTasks: (endpoint, key, identity) => endpoint.readTasks(key, identity),

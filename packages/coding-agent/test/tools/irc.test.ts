@@ -174,12 +174,12 @@ describe("IRC", () => {
 			expect(registry.get("0-Killed")?.status).toBe("idle");
 		});
 
-		it("send surfaces recipient delivery errors as failed", async () => {
+		it("send reports queued when a hand-off error retains the message for wait", async () => {
 			const sub = makeFakeSession();
 			registry.register({ id: "0-Sub", displayName: "task", kind: "sub", session: sub.session });
 			sub.setError(new Error("boom"));
 			const receipt = await bus.send({ from: "0-Main", to: "0-Sub", body: "ping" });
-			expect(receipt).toEqual({ to: "0-Sub", outcome: "failed", error: "boom" });
+			expect(receipt).toEqual({ to: "0-Sub", outcome: "queued" });
 			expect((await bus.wait("0-Sub", {}, 5))?.body).toBe("ping");
 		});
 
@@ -442,7 +442,7 @@ describe("IRC", () => {
 
 			main.setError(new Error("temporarily unavailable"));
 			const receipt = await bus.send({ from: "0-Sub", to: "0-Main", body: "earlier" });
-			expect(receipt.outcome).toBe("failed");
+			expect(receipt.outcome).toBe("queued");
 
 			// Resolves from the mailbox synchronously; the timeout never fires.
 			const msg = await bus.wait("0-Main", { from: "0-Sub" }, 5);

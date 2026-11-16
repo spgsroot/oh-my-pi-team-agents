@@ -63,11 +63,10 @@ on demand:
    failure is promised. The process-wide incoming ledger covers Main,
    subagents, and worker links; only the addressed agent can claim its request.
    Automatic relays atomically claim before sending detached, so remote
-   transport does not hold up turn settlement. An automatic relay only sends to
-   the endpoint the request came from: the sender's `fromUrl` must match a
-   registered peer, and a legacy request without one needs exactly one
-   same-skill candidate — otherwise the reply waits for a manual `a2a:<name>`
-   spawn (see below).
+   transport does not hold up turn settlement. Both explicit replies and
+   automatic relays match the request's sender endpoint: `fromUrl` must match
+   a registered peer, and a legacy request without one needs exactly one
+   same-skill candidate. Ambiguous requests remain open (see below).
 
 Terminals that start later become visible on demand: a bare `read agent://`
 roster, or a task-tool spawn of an unknown `a2a:` name, triggers a debounced
@@ -145,8 +144,10 @@ A spawn of `a2a:<name>` goes through the task tool like any agent:
    A subagent must `wait` on its reply job before its run ends; otherwise the
    job is cancelled and a late reply arrives at Main over IRC.
 
-An explicit task-tool reply claims the outstanding request addressed to that
-agent from that peer and attaches `metadata.inReplyTo`. The claim is a
+An explicit task-tool reply claims the oldest outstanding request addressed to
+that agent whose sender resolves to the selected peer endpoint, and attaches
+`metadata.inReplyTo`. A same-named peer at another URL cannot consume it. If no
+request matches, the task starts a new addressed exchange. The claim is a
 temporary lease: it is acknowledged only when the reply send actually succeeds,
 and released back to its original position when the send fails, throws, or the
 claiming worker is lost, so a failed attempt never strands the request. Set
@@ -156,9 +157,9 @@ addressed reply job. There is no exactly-once delivery guarantee across
 network or acknowledgement failure: a worker lost after the peer accepted the
 reply but before the local acknowledgement can leave the request reopened.
 
-**Automatic reply destinations are resolved by endpoint, never by first
-match.** When an automatic relay (Main's final text or a subagent's wake-turn
-output) answers a request, the sender is resolved from the registered roster:
+**Reply destinations are resolved by endpoint, never by first match.**
+Explicit task replies and automatic relays (Main's final text or a subagent's
+wake-turn output) resolve the sender from the registered roster:
 candidates are registrations whose skill id equals the request's `from`, and
 the request's retained `metadata.fromUrl` (the sender's own bridge URL, carried
 on the wire) must match a candidate's registered endpoint URL by normal URL
@@ -167,11 +168,11 @@ equivalence (`localhost` is not `127.0.0.1`). A URL matching no registered
 endpoint never falls back to a different one; the reply is refused. A legacy
 request without `fromUrl` resolves only when exactly one candidate exists:
 two or more registrations sharing that skill id make the destination
-ambiguous, and the relay refuses rather than picking one arbitrarily. In
-every refusal the lease is released and the request stays open at its original
-position for a manual reply — spawn `a2a:<name>-2` (the suffixed twin)
-explicitly to pick a specific endpoint — and a later unrelated human turn is
-never relayed as a retry. Only registered peers and their existing
+ambiguous, so neither an explicit reply nor a relay claims it arbitrarily.
+A failed automatic reply releases its lease and leaves the request open at
+its original position. A manual reply can select a suffixed peer such as
+`a2a:<name>-2`, but still requires a matching endpoint or an unambiguous legacy
+sender. A later unrelated human turn is never relayed as a retry. Only registered peers and their existing
 credentials are used; an inbound `fromUrl` is disambiguation bookkeeping and
 never constructs a destination or supplies credentials.
 

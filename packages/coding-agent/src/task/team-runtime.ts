@@ -206,11 +206,12 @@ export class TeamRuntime {
 				// An idle lead is woken only when the team as a whole went quiet —
 				// the moment it has results to act on. While another member still
 				// works (or is registering), the notice folds into its next turn.
-				const othersWorking =
-					state.pendingRefs.size > 0 ||
-					[...state.members.values()].some(
-						other => other.id !== event.ref.id && registry.get(other.id)?.status === "running",
-					);
+				const othersWorking = [...state.members.values()].some(
+					other =>
+						other.id !== event.ref.id &&
+						other.failure === undefined &&
+						(!other.ref || registry.get(other.id)?.status === "running"),
+				);
 				void IrcBus.global()
 					.send({
 						from: event.ref.id,
@@ -812,11 +813,23 @@ export class TeamRuntime {
 		plan.submissions = submission;
 	}
 
-	#planTarget(lead: object, handle: string): { state: RuntimeTeam; member: TeamMembership; plan: MemberPlan } {
-		const matches = [...(this.#sessions.get(lead)?.values() ?? [])].flatMap(state =>
-			[...state.members]
-				.filter(([name, member]) => name === handle || member.id === handle)
-				.map(([name, member]) => ({ state, name, member })),
+	#planTarget(
+		lead: object,
+		handle: string,
+		identity?: TeamIdentity,
+	): { state: RuntimeTeam; member: TeamMembership; plan: MemberPlan } {
+		const teams = this.#sessions.get(lead);
+		if (identity && teams?.get(identity.team)?.generation !== identity.generation)
+			throw new TeamRuntimeError("TEAM_STALE_GENERATION", "Team generation changed");
+		const matches = [...(teams?.values() ?? [])].flatMap(state =>
+			identity && state.name !== identity.team
+				? []
+				: [...state.members]
+						.filter(
+							([name, member]) =>
+								(name === handle || member.id === handle) && (!identity || member.id === identity.memberId),
+						)
+						.map(([name, member]) => ({ state, name, member })),
 		);
 		if (matches.length > 1) throw new Error(`ambiguous member handle "${handle}"`);
 		const target = matches[0];
@@ -831,8 +844,8 @@ export class TeamRuntime {
 		return { state, member, plan: this.#memberPlan(state, name, member) };
 	}
 
-	async approve(lead: object, handle: string, revision?: number): Promise<void> {
-		const { state, member, plan } = this.#planTarget(lead, handle);
+	async approve(lead: object, handle: string, revision?: number, identity?: TeamIdentity): Promise<void> {
+		const { state, member, plan } = this.#planTarget(lead, handle, identity);
 		if (!plan.submitted)
 			throw new Error(`No submitted plan; ask the member to send it via write team://${state.name}/plan`);
 		if (revision !== undefined && revision !== plan.submissions)
@@ -850,8 +863,14 @@ export class TeamRuntime {
 		if (receipt.outcome === "failed") throw new Error(`Plan approved, but notification failed: ${receipt.error}`);
 	}
 
-	async reject(lead: object, handle: string, reason: string, revision?: number): Promise<void> {
-		const { state, member, plan } = this.#planTarget(lead, handle);
+	async reject(
+		lead: object,
+		handle: string,
+		reason: string,
+		revision?: number,
+		identity?: TeamIdentity,
+	): Promise<void> {
+		const { state, member, plan } = this.#planTarget(lead, handle, identity);
 		if (!reason.trim()) throw new Error("Rejection requires a reason");
 		if (!plan.submitted)
 			throw new Error(`No submitted plan; ask the member to send it via write team://${state.name}/plan`);

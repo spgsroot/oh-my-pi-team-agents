@@ -171,6 +171,55 @@ describe("team:// routing", () => {
 		}
 	});
 
+	it("decides only the URL's team when two teams share a member handle", async () => {
+		const registry = AgentRegistry.global();
+		const suffix = crypto.randomUUID();
+		const receive = async () => "injected" as const;
+		const lead = { instanceKey: `scope-lead-${suffix}`, deliverIrcMessage: receive } as unknown as AgentSession;
+		registerLocalSession(lead);
+		const leadRef = registry.register({ id: `lead-${suffix}`, displayName: "lead", kind: "main", session: lead });
+		const members = [];
+		const router = new InternalUrlRouter();
+		try {
+			for (const name of ["alpha", "beta"]) {
+				const child = { instanceKey: `${name}-${suffix}`, deliverIrcMessage: receive } as unknown as AgentSession;
+				registerLocalSession(child);
+				const ref = registry.register({ id: `${name}-${suffix}`, displayName: name, kind: "sub", session: child });
+				const team = `${name}-${suffix}`;
+				const started = await teamRuntime.start(lead, {
+					name: team,
+					description: "",
+					members: [],
+					body: "",
+					source: "project",
+					filePath: "scope.md",
+					planApproval: true,
+				});
+				started.members.set("Reviewer", { id: ref.id, ref });
+				const identity = { team, generation: started.generation, memberId: ref.id };
+				members.push({ child, ref, identity });
+				await teamRuntime.submitPlan(child, identity, `Plan for ${name}`);
+			}
+			const first = members[0]!;
+			const second = members[1]!;
+			const session = { getSessionInstanceKey: () => lead.instanceKey } as ToolSession;
+			await router.write(`team://${first.identity.team}/plan/Reviewer`, "approve --rev 1", { session });
+			expect(await teamRuntime.planPending(first.child, first.identity)).toBe(false);
+			expect(await teamRuntime.planPending(second.child, second.identity)).toBe(true);
+			await router.write(`team://${second.identity.team}/plan/${second.ref.id}`, "reject --rev 1: revise", {
+				session,
+			});
+			expect(await teamRuntime.planPending(first.child, first.identity)).toBe(false);
+			expect(await teamRuntime.planPending(second.child, second.identity)).toBe(true);
+		} finally {
+			for (const member of members) {
+				await teamRuntime.stop(lead, member.identity.team);
+				registry.unregister(member.ref.id, member.ref);
+			}
+			registry.unregister(leadRef.id, leadRef);
+		}
+	});
+
 	it("rejects malformed task paths and never locates the ledger", async () => {
 		const router = new InternalUrlRouter();
 		for (const url of ["team://audit", "team://audit/tasks/1", "team://audit/tasks/1/claim/extra"]) {

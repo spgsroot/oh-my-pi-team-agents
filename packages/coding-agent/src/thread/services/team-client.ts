@@ -122,11 +122,11 @@ export class TeamEndpoint implements TeamClient {
 	submitPlan(key: string, identity: TeamIdentity, text: string) {
 		return teamRuntime.submitPlan(this.#session(key), identity, text);
 	}
-	approve(key: string, handle: string, revision?: number) {
-		return teamRuntime.approve(this.#session(key), handle, revision);
+	approve(key: string, handle: string, revision?: number, identity?: TeamIdentity) {
+		return teamRuntime.approve(this.#session(key), handle, revision, identity);
 	}
-	reject(key: string, handle: string, reason: string, revision?: number) {
-		return teamRuntime.reject(this.#session(key), handle, reason, revision);
+	reject(key: string, handle: string, reason: string, revision?: number, identity?: TeamIdentity) {
+		return teamRuntime.reject(this.#session(key), handle, reason, revision, identity);
 	}
 	respondStop(key: string, identity: TeamIdentity, requestId: string, body: string) {
 		return teamRuntime.respondStop(this.#session(key), identity, requestId, body);

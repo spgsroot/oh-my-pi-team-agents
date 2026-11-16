@@ -54,11 +54,12 @@ interface RateWindow {
 interface DedupEntry {
 	key: string;
 	ts: number;
+	id: string;
 }
 
 export class IrcIngressGuard {
 	readonly #rates = new Map<string, RateWindow>();
-	readonly #dedup = new Map<string, number>();
+	readonly #dedup = new Map<string, DedupEntry>();
 	readonly #dedupOrder: DedupEntry[] = [];
 	#dedupHead = 0;
 	/** Highest send time seen; see {@link IrcIngressGuard.check}. */
@@ -98,6 +99,12 @@ export class IrcIngressGuard {
 		return undefined;
 	}
 
+	/** Roll back only this delivery's reservation, never a newer retry's. */
+	release(message: IrcMessage, limits: IrcIngressLimits): void {
+		const key = this.#dedupKey(message, limits.dedupWindowMs);
+		if (key !== undefined && this.#dedup.get(key)?.id === message.id) this.#dedup.delete(key);
+	}
+
 	#checkHops(message: IrcMessage, maxHops: number): IrcIngressRefusal | undefined {
 		const hops = message.hops?.length ?? 0;
 		if (maxHops <= 0 || hops <= maxHops) return undefined;
@@ -129,7 +136,7 @@ export class IrcIngressGuard {
 			if (now - entry.ts < windowMs) break;
 			// A refreshed key has a newer entry later in the FIFO; only drop the
 			// mapping when this is still the entry it belongs to.
-			if (this.#dedup.get(entry.key) === entry.ts) this.#dedup.delete(entry.key);
+			if (this.#dedup.get(entry.key) === entry) this.#dedup.delete(entry.key);
 			this.#dedupHead++;
 		}
 		if (this.#dedupHead >= COMPACT_THRESHOLD) {
@@ -195,8 +202,9 @@ export class IrcIngressGuard {
 	/** Commit an accepted send: claim the dedup key and charge the rate window. */
 	#accept(message: IrcMessage, dedupKey: string | undefined, limits: IrcIngressLimits, now: number): void {
 		if (dedupKey !== undefined) {
-			this.#dedup.set(dedupKey, now);
-			this.#dedupOrder.push({ key: dedupKey, ts: now });
+			const entry = { key: dedupKey, ts: now, id: message.id };
+			this.#dedup.set(dedupKey, entry);
+			this.#dedupOrder.push(entry);
 		}
 		if (
 			limits.rateLimitTokens <= 0 ||

@@ -5,6 +5,8 @@ import type { AgentRegistryApi } from "../registry/agent-registry";
 export interface IncomingRequestMatch {
 	to: string;
 	from?: string;
+	/** Exact recorded endpoint; null matches requests without an endpoint. */
+	fromUrl?: string | null;
 	messageId?: string;
 }
 
@@ -87,6 +89,7 @@ export class IncomingRequests implements IncomingRequestsApi {
 				entry.lease === undefined &&
 				entry.request.to === match.to &&
 				(match.from === undefined || entry.request.from === match.from) &&
+				(match.fromUrl === undefined || (entry.request.fromUrl ?? null) === match.fromUrl) &&
 				(match.messageId === undefined || entry.request.messageId === match.messageId),
 		);
 		if (entry === undefined) return undefined;
@@ -133,6 +136,7 @@ export class IncomingRequests implements IncomingRequestsApi {
 			const matches =
 				entry.request.to === match.to &&
 				(match.from === undefined || entry.request.from === match.from) &&
+				(match.fromUrl === undefined || (entry.request.fromUrl ?? null) === match.fromUrl) &&
 				(match.messageId === undefined || entry.request.messageId === match.messageId);
 			if (!matches) kept.push(entry);
 		}

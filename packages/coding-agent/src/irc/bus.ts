@@ -217,7 +217,10 @@ export class IrcBus implements IrcBusApi {
 		// Taken before delivery: a reply sent while this message is still being
 		// delivered must still order after it.
 		const mark: SendMark = { ts: message.ts, seq: ++this.#sendSeq };
-		const receipt = await this.#deliver(message);
+		const { receipt, buffered } = await this.#deliver(message);
+		// A failed hand-off that fell back to the mailbox still reaches the
+		// recipient, so its reservation must stand or a retry would duplicate it.
+		if (receipt.outcome === "failed" && !buffered && limits) this.#ingress.release(message, limits);
 		// A team notice is informational: it answers nothing, promises nothing
 		// and never stands in for the reply a wake relay would skip. The plan
 		// exchange is the one exception: a submission asks the lead for a
@@ -336,22 +339,18 @@ export class IrcBus implements IrcBusApi {
 		return unanswered;
 	}
 
-	async #deliver(message: IrcMessage): Promise<IrcDeliveryReceipt> {
+	async #deliver(message: IrcMessage): Promise<{ receipt: IrcDeliveryReceipt; buffered: boolean }> {
+		const failed = (error: string) => ({
+			receipt: { to: message.to, outcome: "failed" as const, error },
+			buffered: false,
+		});
 		const ref = this.#registry.get(message.to);
 		if (!ref) {
-			return {
-				to: message.to,
-				outcome: "failed",
-				error: `Unknown agent "${message.to}" — check the subagent roster or read history:// for known peers.`,
-			};
+			return failed(`Unknown agent "${message.to}" — check the subagent roster or read history:// for known peers.`);
 		}
 		// Advisor refs are observability-only transcripts, never messageable peers.
 		if (ref.kind === "advisor") {
-			return {
-				to: message.to,
-				outcome: "failed",
-				error: `Agent "${message.to}" is a read-only advisor transcript and cannot be messaged.`,
-			};
+			return failed(`Agent "${message.to}" is a read-only advisor transcript and cannot be messaged.`);
 		}
 
 		// A `parked` or killed (`aborted`) recipient always needs the lifecycle to
@@ -380,11 +379,7 @@ export class IrcBus implements IrcBusApi {
 			} catch (error) {
 				// Not revivable / released / revive failed. Do not buffer: a permanent
 				// failure must not inflate unread counts or pretend delivery is pending.
-				return {
-					to: message.to,
-					outcome: "failed",
-					error: error instanceof Error ? error.message : String(error),
-				};
+				return failed(error instanceof Error ? error.message : String(error));
 			}
 		}
 
@@ -395,27 +390,31 @@ export class IrcBus implements IrcBusApi {
 		if (waiter) {
 			waiter.resolve(message);
 			this.#relayToMainUi(message);
-			return { to: message.to, outcome: revived ? "revived" : "injected" };
+			return { receipt: { to: message.to, outcome: revived ? "revived" : "injected" }, buffered: false };
 		}
 
 		const session = this.#registry.get(message.to)?.session;
 		if (!session) {
-			return { to: message.to, outcome: "failed", error: `Agent "${message.to}" has no live session.` };
+			return failed(`Agent "${message.to}" has no live session.`);
 		}
 
 		try {
 			const delivery = await session.deliverIrcMessage(message);
 			this.#relayToMainUi(message);
-			return { to: message.to, outcome: revived ? "revived" : delivery };
+			return { receipt: { to: message.to, outcome: revived ? "revived" : delivery }, buffered: false };
 		} catch (error) {
 			// A full queue explicitly refused this delivery; buffering it would turn
 			// the failed receipt into an unexpected later delivery.
 			// Other live hand-off failures retain their existing mailbox fallback.
-			if (!(error instanceof IrcQueueFullError)) this.#enqueue(message);
+			const buffered = !(error instanceof IrcQueueFullError);
+			if (buffered) this.#enqueue(message);
 			return {
-				to: message.to,
-				outcome: "failed",
-				error: error instanceof Error ? error.message : String(error),
+				receipt: {
+					to: message.to,
+					outcome: buffered ? "queued" : "failed",
+					...(buffered ? {} : { error: error instanceof Error ? error.message : String(error) }),
+				},
+				buffered,
 			};
 		}
 	}

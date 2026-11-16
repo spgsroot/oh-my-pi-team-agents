@@ -96,6 +96,7 @@ import {
 } from "../a2a/agent-bridge";
 import { IncomingRequests, type IncomingRequestLease } from "../a2a/incoming-requests";
 import { OutgoingRequests } from "../a2a/outgoing-requests";
+import { findPeer } from "../a2a/reply-relay";
 import { TASK_STATE } from "../a2a/rpc";
 import {
 	cfgA2aClientTimeoutMs,
@@ -2254,11 +2255,21 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const assignment = (args.params.task ?? "").trim();
 		// `a2aSpawn: true` is an explicit spawn outside incoming matching.
 		if (args.params.a2aSpawn === true) return this.#finishA2aRun(args, assignment);
-		const lease = await IncomingRequests.global().consume({
-			to: this.session.getAgentId?.() ?? MAIN_AGENT_ID,
-			from: args.agent.skillId,
-		});
-		if (lease !== undefined) return this.#finishA2aRun(args, assignment, lease);
+		const incoming = IncomingRequests.global();
+		const to = this.session.getAgentId?.() ?? MAIN_AGENT_ID;
+		const bridge = this.session.getA2aBridge?.();
+		if (bridge) {
+			for (const request of await incoming.list(to)) {
+				if (findPeer(bridge, request)?.name !== args.agent.name) continue;
+				const lease = await incoming.consume({
+					to,
+					from: request.from,
+					fromUrl: request.fromUrl ?? null,
+					messageId: request.messageId,
+				});
+				if (lease !== undefined) return this.#finishA2aRun(args, assignment, lease);
+			}
+		}
 		return this.#awaitAddressedA2aReply(args, assignment);
 	}
 

@@ -245,10 +245,13 @@ describe("team idle notifications", () => {
 		} as unknown as AgentSessionHandle;
 		registry.register({ id: "lead", displayName: "lead", kind: "sub", session: lead, status: "idle" });
 		const child = { messages: [] } as unknown as AgentSessionHandle;
-		const first = registry.register({ id: "first", displayName: "first", kind: "sub", session: child });
-		const second = registry.register({ id: "second", displayName: "second", kind: "sub", session: child });
 		const runtime = new TeamRuntime();
 		const started = await runtime.start(lead, team);
+		// Match /team start: reserve before registration, then record the live ref.
+		started.members.set("first", { id: "first" });
+		started.members.set("second", { id: "second" });
+		const first = registry.register({ id: "first", displayName: "first", kind: "sub", session: child });
+		const second = registry.register({ id: "second", displayName: "second", kind: "sub", session: child });
 		started.members.set("first", { id: "first", ref: first });
 		started.members.set("second", { id: "second", ref: second });
 

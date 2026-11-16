@@ -66,11 +66,11 @@ export class RemoteTeamClient implements TeamClient {
 	submitPlan(key: string, identity: TeamIdentity, text: string) {
 		return this.remote.call("submitPlan", key, identity, text);
 	}
-	approve(key: string, handle: string, revision?: number) {
-		return this.remote.call("approve", key, handle, revision);
+	approve(key: string, handle: string, revision?: number, identity?: TeamIdentity) {
+		return this.remote.call("approve", key, handle, revision, identity);
 	}
-	reject(key: string, handle: string, reason: string, revision?: number) {
-		return this.remote.call("reject", key, handle, reason, revision);
+	reject(key: string, handle: string, reason: string, revision?: number, identity?: TeamIdentity) {
+		return this.remote.call("reject", key, handle, reason, revision, identity);
 	}
 	respondStop(key: string, identity: TeamIdentity, requestId: string, body: string) {
 		return this.remote.call("respondStop", key, identity, requestId, body);
