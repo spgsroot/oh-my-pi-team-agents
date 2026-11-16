@@ -744,6 +744,9 @@ describe("collision handling", () => {
 		const claudeFile = path.join(project, ".claude", "skills", "calendar", "SKILL.md");
 		await fs.mkdir(path.dirname(claudeFile), { recursive: true });
 		await fs.copyFile(claudeFrom, claudeFile);
+		// Project-level discovery walks up to the repo root. os.tmpdir() sits under the real home on
+		// Windows, so without a repo marker the walk reaches the user's own `.agents/skills` install.
+		await fs.mkdir(path.join(project, ".git"));
 		let agentsFile: string | undefined;
 		if (agentsFrom) {
 			agentsFile = path.join(project, ".agents", "skills", "calendar", "SKILL.md");
@@ -985,6 +988,7 @@ describe("collision handling", () => {
 
 	it("lets a custom-directory skill override a provider skill and keeps a taken namespaced slot suffixed", async () => {
 		const project = await fs.mkdtemp(path.join(os.tmpdir(), "skills-displaced-"));
+		await fs.mkdir(path.join(project, ".git"));
 		try {
 			// Project-level .claude/skills/calendar (provider "claude"; the dotted
 			// home makes its namespace fall back to the provider id) versus a custom

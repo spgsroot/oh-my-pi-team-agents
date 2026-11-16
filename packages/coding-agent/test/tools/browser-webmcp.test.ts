@@ -17,9 +17,10 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/browser/webmcp";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import { rejectionOf } from "../helpers/rejection";
-import { chromiumAvailable } from "./chromium-probe";
+import { chromiumAvailable, localhostServerReachable } from "./chromium-probe";
 
-const CHROMIUM_AVAILABLE = await chromiumAvailable();
+// These tests bind `localhost` so same-site and cross-site iframes differ; they need a reachable loopback name.
+const CHROMIUM_AVAILABLE = (await chromiumAvailable()) && (await localhostServerReachable());
 const BROWSER_TEST_TIMEOUT_MS = 30_000;
 
 // One headless Chromium for the file, held across it; the browser host's tabs open in it too. Each test closes the

@@ -6,7 +6,8 @@
  * of the unit suites; run it when changing team prompts, notices or protocol.
  *
  * Usage: bun scripts/eval-team-coordination.ts --model <provider/id> [--max-discovery-share 0.1] [--timeout-ms 900000] [--keep]
- * Exits 0 when the change landed and the discovery share stays within bounds.
+ * Exits 0 when the change landed and the discovery share stays within bounds, 1 when it did not, and 2 when the
+ * model call itself failed (a provider error proves nothing about the protocol).
  */
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -21,6 +22,8 @@ interface Frame {
 	id?: string;
 	data?: { sessionFile?: string; isSettled?: boolean; agentInvoked?: boolean };
 	success?: boolean;
+	status?: string;
+	error?: { message?: string };
 }
 
 const TEAM_FILE = `---
@@ -28,7 +31,7 @@ name: calc
 description: Calculator maintenance crew
 planApproval: true
 members:
-  - agent: task
+  - agent: coordination-eval
     handle: Builder
     role: Implement the change
 ---
@@ -57,6 +60,10 @@ async function main(): Promise<number> {
 		"export function add(a: number, b: number) { return a + b; }\n",
 	);
 	await Bun.write(path.join(project, ".omp", "teams", "calc.md"), TEAM_FILE);
+	await Bun.write(
+		path.join(project, ".omp", "agents", "coordination-eval.md"),
+		`---\nname: coordination-eval\ndescription: Coordination evaluation worker\nmodel: ${JSON.stringify(options.model)}\n---\nComplete the assigned team task and follow its plan approval protocol.\n`,
+	);
 	const overlay = path.join(project, "eval-config.yml");
 	await Bun.write(overlay, "team:\n  enabled: true\na2a:\n  enabled: false\n");
 
@@ -123,7 +130,12 @@ async function main(): Promise<number> {
 			message:
 				"You lead team calc. Get the assignment in the team file done through your member, deciding its plan, then tell me when src/app.ts has `sub`.",
 		});
-		await next(frame => frame.type === "prompt_result" && frame.id === kickoff, options.timeoutMs);
+		const kicked = await next(frame => frame.type === "prompt_result" && frame.id === kickoff, options.timeoutMs);
+		if (kicked?.status === "error") {
+			// A provider failure says nothing about the team protocol: report it apart from a real failure.
+			process.stdout.write(`inconclusive, model call failed: ${kicked.error?.message ?? "unknown error"}\n`);
+			return 2;
+		}
 		while (Date.now() < deadline) {
 			landed = (await Bun.file(path.join(project, "src", "app.ts")).text()).includes("function sub");
 			const state = await request({ type: "get_state" });
@@ -149,8 +161,13 @@ async function main(): Promise<number> {
 		return landed && share <= options.maxShare ? 0 : 1;
 	} finally {
 		child.kill();
-		if (!options.keep) await fs.rm(project, { recursive: true, force: true });
-		else process.stdout.write(`project kept at ${project}\n`);
+		await child.exited;
+		if (!options.keep) {
+			// A helper process may still hold the directory on Windows; a leftover temp dir must not change the verdict.
+			await fs
+				.rm(project, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 })
+				.catch(error => process.stderr.write(`could not remove ${project}: ${String(error)}\n`));
+		} else process.stdout.write(`project kept at ${project}\n`);
 	}
 }
 

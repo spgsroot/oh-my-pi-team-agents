@@ -117,3 +117,25 @@ export function visibleBrowserAvailable(): Promise<boolean> {
 	})();
 	return visibleProbe;
 }
+
+let localhostProbe: Promise<boolean> | undefined;
+
+/**
+ * Whether a server bound to `localhost` can be reached by name on this host.
+ * Bun binds `localhost` to the IPv6 loopback first; a host that blocks `::1`
+ * (or a firewall/proxy that intercepts it) refuses every connection, so tests
+ * that bind `localhost` for same-site iframe coverage cannot run there.
+ */
+export function localhostServerReachable(): Promise<boolean> {
+	localhostProbe ??= (async () => {
+		const server = Bun.serve({ port: 0, hostname: "localhost", fetch: () => new Response("ok") });
+		try {
+			return (await fetch(`http://localhost:${server.port}/`)).ok;
+		} catch {
+			return false;
+		} finally {
+			server.stop(true);
+		}
+	})();
+	return localhostProbe;
+}

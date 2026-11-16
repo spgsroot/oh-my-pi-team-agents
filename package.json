@@ -82,6 +82,8 @@
 		"test": "bun scripts/ci-test-ts.ts local",
 		"test:ts": "bun scripts/ci-test-ts.ts local-ts",
 		"test:scripts": "bun test scripts",
+		"test:coordination": "bun --cwd=packages/coding-agent test a2a team irc agents-bridge",
+		"eval:a2a": "bun scripts/eval-a2a.ts",
 		"eval:team-coordination": "bun scripts/eval-team-coordination.ts",
 		"metric:team-coordination": "bun scripts/team-coordination-overhead.ts",
 		"test:rs": "bun scripts/run-rs-task.ts test:rs",

@@ -1,8 +1,11 @@
 import { describe, expect, it } from "bun:test";
-import { $which, TempDir } from "@oh-my-pi/pi-utils";
+import { TempDir } from "@oh-my-pi/pi-utils";
 import { PYTHON_PRELUDE } from "../../../src/eval/py/prelude";
 import { artifactReadBridge } from "../../helpers/artifact-read-bridge";
-const pythonPath = Bun.env.PYTHON ?? ($which("python3") ? "python3" : "python");
+import { findPythonInterpreter } from "../../helpers/python-interpreter";
+
+const foundPython = findPythonInterpreter();
+const pythonPath = foundPython ?? "python";
 
 async function runPrelude(
 	code: string,
@@ -36,7 +39,7 @@ async function runPrelude(
 	}
 }
 
-describe("python prelude", () => {
+describe.skipIf(!foundPython)("python prelude", () => {
 	it("infers eval tool schemas and replaces definitions by name", async () => {
 		const result = await runPrelude(
 			[
@@ -317,7 +320,7 @@ describe("python prelude", () => {
 	});
 });
 
-describe("python workpool model selection", () => {
+describe.skipIf(!foundPython)("python workpool model selection", () => {
 	it("forwards an exact model selector and preserves omission through the real Python bridge", async () => {
 		const requests: unknown[] = [];
 		const server = Bun.serve({

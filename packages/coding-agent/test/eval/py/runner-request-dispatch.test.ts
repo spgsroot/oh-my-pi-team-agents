@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
-import { $which } from "@oh-my-pi/pi-utils";
+import { findPythonInterpreter } from "../../helpers/python-interpreter";
 
 interface RunnerFrame {
 	type?: string;
@@ -12,7 +12,8 @@ interface RunnerFrame {
 	admissionRejected?: boolean;
 }
 
-const pythonPath = Bun.env.PYTHON ?? ($which("python3") ? "python3" : "python");
+const foundPython = findPythonInterpreter();
+const pythonPath = foundPython ?? "python";
 const runnerPath = path.resolve(import.meta.dir, "../../../src/eval/py/runner.py");
 const repoRoot = path.resolve(import.meta.dir, "../../../../..");
 const encoder = new TextEncoder();
@@ -105,7 +106,7 @@ async function collectDoneOrder(runner: Runner, ids: Set<string>): Promise<Runne
 // requests while a cell is parked on a top-level await instead of blocking the
 // control channel until it finishes -- the regression that a naive fix for the
 // Windows numpy import hang (#7985) would introduce.
-describe("Python runner request dispatch", () => {
+describe.skipIf(!foundPython)("Python runner request dispatch", () => {
 	it("interleaves a fast request past a slow one parked on a top-level await", async () => {
 		if (process.platform === "win32") return; // Windows dispatches serially by design; see _serve_windows.
 		const runner = spawnRunner();

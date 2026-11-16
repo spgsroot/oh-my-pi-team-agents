@@ -3,6 +3,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { nativeAddonProblem } from "./check-native-addon";
 import { requireBunVersion } from "./require-bun";
 
 type Mode =
@@ -1041,6 +1042,15 @@ if (import.meta.main) {
 	// INF-2: one Bun for the whole run — refuse to start under an older Bun
 	// before any child chunk spawns under it.
 	requireBunVersion();
+	// A stale addon fails dozens of unrelated chunks with `undefined is not a constructor`;
+	// stop before spawning any. CI builds the addon in the same job.
+	if (!isDryRun && !isCI()) {
+		const problem = await nativeAddonProblem();
+		if (problem) {
+			console.error(`${problem}. Rebuild it with \`bun run build:native\` (or set OMP_SKIP_NATIVE_CHECK=1).`);
+			process.exit(1);
+		}
+	}
 	if (!(requestedMode in validModes)) {
 		throw new Error(
 			`Unknown mode ${shellQuote(requestedMode)}. Expected one of: ${Object.keys(validModes).join(", ")}`,

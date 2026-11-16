@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
-import { $which, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { findPythonInterpreter } from "../helpers/python-interpreter";
 import { Settings } from "../../src/config/settings";
 import { disposeAllVmContexts } from "../../src/eval/js/context-manager";
 import { disposeAllKernelSessions } from "../../src/eval/py/executor";
@@ -37,7 +38,7 @@ function makeSession(...tools: AgentTool[]): ToolSession {
 		settings: Settings.isolated({
 			"async.enabled": false,
 			"eval.autoProvision": false,
-			"python.interpreter": Bun.env.PYTHON ?? $which("python3") ?? $which("python") ?? "",
+			"python.interpreter": findPythonInterpreter() ?? "",
 		}),
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",

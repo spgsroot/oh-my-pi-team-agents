@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
-import { $which } from "@oh-my-pi/pi-utils";
+import { findPythonInterpreter } from "../../helpers/python-interpreter";
 
 interface RunnerFrame {
 	type?: string;
@@ -9,7 +9,8 @@ interface RunnerFrame {
 	status?: string;
 }
 
-const pythonPath = Bun.env.PYTHON ?? ($which("python3") ? "python3" : "python");
+const foundPython = findPythonInterpreter();
+const pythonPath = foundPython ?? "python";
 const runnerPath = path.resolve(import.meta.dir, "../../../src/eval/py/runner.py");
 const repoRoot = path.resolve(import.meta.dir, "../../../../..");
 const encoder = new TextEncoder();
@@ -99,7 +100,7 @@ async function runCells(codes: string[]): Promise<RunnerFrame[][]> {
 	}
 }
 
-describe("Python runner shell output streaming", () => {
+describe.skipIf(!foundPython)("Python runner shell output streaming", () => {
 	it("streams !cmd output chunks before the child process exits", async () => {
 		const child = [
 			"import sys,time",
@@ -210,7 +211,7 @@ describe("Python runner shell output streaming", () => {
 			"sys.stdout.write('second')",
 			"sys.stdout.flush()",
 		].join(";");
-		const frames = await runCell(`%%bash\n${pythonPath} -c ${shellQuote(child)}`);
+		const frames = await runCell(`%%bash\n${shellQuote(pythonPath)} -c ${shellQuote(child)}`);
 		const stdout = frames.filter(frame => frame.type === "stdout").map(frame => frame.data);
 
 		expect(stdout[0]).toBe("first");
