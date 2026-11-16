@@ -221,7 +221,9 @@ They are informational: they impose no automatic reply obligation or wake-relay
 loop, and they count as neither a reply nor a promise of one — except the plan
 exchange: a submission is an ask the lead owes a decision on, and the lead's
 approval or rejection answers it, so a member's `wait` after
-`write team://<name>/plan` blocks until the decision arrives. A notice addressed
+`write team://<name>/plan` blocks until the decision arrives; an ordinary message
+from the lead in between (a nudge, a question) ends that wait as any direct
+message does, but leaves the decision owed, so the next `wait` blocks again. A notice addressed
 to an agent ends that agent's blocked reply `wait`, but it never interrupts a
 wait on its own background jobs or services: there it stays queued and is
 delivered as an aside once the wait returns.
@@ -425,7 +427,9 @@ exceeds the threshold.
 
 `bun run eval:team-coordination --model <provider/id>` runs a live scenario — a
 lead and a plan-gated member add a function to a scratch project — and scores
-its transcripts with the same metric. It needs model credentials, so it is not
+its transcripts with the same metric. It passes only when the change landed and
+the lead, after ending its turn, woke on the member's final notice and reported
+after the edit. It needs model credentials, so it is not
 part of the unit suites; run it when changing team prompts, notices or the
 protocol.
 

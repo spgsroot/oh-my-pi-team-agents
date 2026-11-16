@@ -131,7 +131,9 @@ function noReplyText(replies: PendingReplies): string {
 	if (replies.stopped.length > 0) {
 		return `${ids(replies.stopped)} finished its turn without replying. Ask again, or finish without the answer.`;
 	}
-	return "no background job or service you started is running, and no agent you messaged this run owes a reply. Other agents' results and messages arrive on their own.";
+	// Live team runs: a lead told only "messages arrive on their own" re-read
+	// team:// and messaged its member to check, instead of ending its turn.
+	return "no background job or service you started is running, and no agent you messaged this run owes a reply. Messages and team notices reach you on their own; one you must act on (a plan to decide, a finished team) wakes you after your turn ends. Do not re-read state to check: finish what you can now, then end your turn.";
 }
 
 /** Whether `session` has the `wait` tool active, so prompts may point blocked callers at it. */

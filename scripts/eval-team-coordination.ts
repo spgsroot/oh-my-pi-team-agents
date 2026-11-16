@@ -6,7 +6,8 @@
  * of the unit suites; run it when changing team prompts, notices or protocol.
  *
  * Usage: bun scripts/eval-team-coordination.ts --model <provider/id> [--max-discovery-share 0.1] [--timeout-ms 900000] [--keep]
- * Exits 0 when the change landed and the discovery share stays within bounds, 1 when it did not, and 2 when the
+ * Exits 0 when the change landed, the lead woke on its member's final notice and reported after the edit, and the
+ * discovery share stays within bounds; 1 when any of that failed, and 2 when the
  * model call itself failed (a provider error proves nothing about the protocol).
  */
 import * as fs from "node:fs/promises";
@@ -25,7 +26,11 @@ interface Frame {
 	success?: boolean;
 	status?: string;
 	error?: { message?: string };
+	message?: { role?: string; timestamp?: number };
 }
+
+/** How long the lead gets, once the change landed, to wake on the member's notice and report. */
+const REPORT_GRACE_MS = 120_000;
 
 const TEAM_FILE = `---
 name: calc
@@ -123,6 +128,7 @@ async function main(): Promise<number> {
 
 	const deadline = Date.now() + options.timeoutMs;
 	let landed = false;
+	let reported = false;
 	try {
 		await next(frame => frame.type === "ready", 120_000);
 		await request({ type: "prompt", message: "/team start calc" });
@@ -137,10 +143,21 @@ async function main(): Promise<number> {
 			process.stdout.write(`inconclusive, model call failed: ${kicked.error?.message ?? "unknown error"}\n`);
 			return 2;
 		}
-		while (Date.now() < deadline) {
-			landed = (await Bun.file(path.join(project, "src", "app.ts")).text()).includes("function sub");
+		// Landing is the member's half. The lead's half is waking on the member's
+		// final notice and reporting: its last reply must postdate the edit.
+		const appFile = path.join(project, "src", "app.ts");
+		const lastLeadReplyAt = () =>
+			frames.findLast(frame => frame.type === "message_end" && frame.message?.role === "assistant")?.message
+				?.timestamp ?? 0;
+		let reportDeadline = deadline;
+		while (Date.now() < Math.min(deadline, reportDeadline)) {
+			landed = (await Bun.file(appFile).text()).includes("function sub");
 			const state = await request({ type: "get_state" });
-			if (landed && state?.data?.isSettled) break;
+			if (landed) {
+				reportDeadline = Math.min(reportDeadline, Date.now() + REPORT_GRACE_MS);
+				reported = state?.data?.isSettled === true && lastLeadReplyAt() >= (await fs.stat(appFile)).mtimeMs;
+				if (reported) break;
+			}
 			await Bun.sleep(3000);
 		}
 		const sessionFile = (await request({ type: "get_state" }))?.data?.sessionFile;
@@ -158,9 +175,9 @@ async function main(): Promise<number> {
 		}
 		const share = discoveryShare(total);
 		process.stdout.write(
-			`landed=${landed} discovery-share=${(share * 100).toFixed(1)}% (max ${(options.maxShare * 100).toFixed(1)}%) total=${JSON.stringify(total)}\n`,
+			`landed=${landed} reported=${reported} discovery-share=${(share * 100).toFixed(1)}% (max ${(options.maxShare * 100).toFixed(1)}%) total=${JSON.stringify(total)}\n`,
 		);
-		return landed && share <= options.maxShare ? 0 : 1;
+		return landed && reported && share <= options.maxShare ? 0 : 1;
 	} finally {
 		Process.fromPid(child.pid)?.killTree(9);
 		child.kill();

@@ -5,13 +5,15 @@
 ### Added
 - Team members can set `model` and `thinking-level` in the team file; a member whose agent has no model of its own (and is not pinned to the `@task` role) now runs on the lead's active model instead of the `@task` role model
 - `/team approve` and `/team reject` accept `--team <name>` to pick the team when a handle exists in more than one
-- The `/team start` lead note states the initial state (members just spawned, empty task ledger, no plan submitted) so the lead need not read `team://` before its first notice
+- The `/team start` lead note tells the lead to wait for members by ending its turn (the notices it must act on wake it; `wait` blocks only on replies it asked for) and to check results after the member's idle notice, instead of polling `team://` or calling `wait`; members are told their assignment is in the conversation and to read `team://` only when it involves shared tasks
 - IRC delivery receipts report `queued` when a message is kept in the recipient's mailbox but not yet delivered to its session; a retry of that message stays refused as a duplicate instead of arriving twice
 - `bun run test:coordination` runs the offline A2A, Teams, IRC and worker-bridge suites, and `bun run eval:a2a --model <id>` runs a live two-terminal A2A exchange
 - The TypeScript suite fails fast with a rebuild hint when the loaded `pi_natives` addon lacks exports the generated bindings declare, instead of failing dozens of unrelated chunks
 
 ### Fixed
 
+- A member's `wait` after `write team://<team>/plan` now keeps blocking when the lead sends an ordinary message before deciding (e.g. "submit your plan"); only the lead's approval or rejection answers the submission, so the member no longer gets "Nothing to wait for" and polls
+- `wait` with nothing owed now says that notices needing action wake the agent after its turn ends and to end the turn rather than re-read state
 - Explicit A2A replies correlate only with requests from the selected peer endpoint, so terminals sharing a name cannot consume each other's requests.
 - Team completion wakes an idle lead after reserved members finish registering; plan decisions through `team://` stay scoped to the selected team, generation, and member.
 - Worker mailbox overflow remains a delivery refusal across RPC and is never buffered; unbuffered failures allow retries, while messages retained in the mailbox report `queued` and keep duplicate protection for the configured deduplication window.

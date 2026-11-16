@@ -1,6 +1,6 @@
 {{#if planApprovalRequired}}Your changes need an approved plan. Before changing anything, submit your plan with `write team://{{teamName}}/plan` (the write body is the plan), then call `wait` for the lead's decision. A plan written only in your reply or final text is not a submission and cannot be approved.
 
-{{/if}}Shared team tasks are coordinated through the team protocol, whether or not a workspace is configured:
+{{/if}}Your assignment is in this conversation; start on it. Shared team tasks are coordinated through the team protocol, whether or not a workspace is configured. Read them only when your assignment refers to shared tasks or you need a teammate's state:
 - `read team://{{teamName}}` shows the roster, each member's status, and plan state.
 - Use `read team://{{teamName}}/tasks` to see task IDs, titles, owners, status, and notes.
 - Claim a task with `write team://{{teamName}}/tasks/<id>/claim`. If another member owns it, choose another task or coordinate with them; do not work on their task without coordination.
