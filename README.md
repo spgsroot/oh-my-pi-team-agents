@@ -24,6 +24,30 @@ This fork is the hands-on half of that research: the same problems implemented i
 | Who a peer message speaks as | Envelope `cross-session-message`; local hash ledger (not a signature) | A peer terminal's request is a **user** turn, never a developer message; harness tags in the body are escaped |
 | Team control protocol | `shutdown_*`, `plan_approval_*`, `idle_notification` | Plan approval gate (`write team://<team>/plan`, decided by the lead), idle and "team finished" notices, cooperative stop (`team://<team>/stop/<id>`) |
 
+## Compared with stock Pi
+
+This comparison is about the **default Pi coding-agent CLI**, without third-party packages or custom orchestration. The original `badlogic/pi-mono` URL now redirects to `earendil-works/pi`; the baseline is its [source at `9cd49d2c00`](https://github.com/earendil-works/pi/blob/9cd49d2c00ac446f774b878d25923bdb3739dadd/README.md), checked on 2026-11-16. It is not a claim about every application or library in that monorepo.
+
+Pi deliberately leaves subagents and plan mode to extensions and packages. It already has saved sessions, branching, compaction, steering, an SDK and RPC: those are not inventions of this fork. The lineage is **Pi → oh-my-pi → this fork**. The `task` subagent runtime and IRC messaging infrastructure come from oh-my-pi; this fork builds the A2A bridge, Teams protocol and additional coordination controls on that base.
+
+| Mechanism | Stock Pi CLI | This fork and the practical advantage |
+|---|---|---|
+| Delegation and reusable teams | Subagents are an extension/package choice, not a default CLI feature. | Uses omp's subagent runtime; adds `.omp/teams/<name>.md` with roles, member models and optional plan approval. A recurring team can be started with `/team start` instead of assembling an orchestrator for each project. |
+| Communication between terminals | [RPC](https://github.com/earendil-works/pi/blob/9cd49d2c00ac446f774b878d25923bdb3739dadd/packages/coding-agent/docs/rpc.md) lets an external controller drive a child process through stdin/stdout JSONL. This is a host-control interface, not peer discovery. | [A2A](docs/a2a.md) discovers local terminals, addresses them by name and correlates replies over authenticated loopback HTTP. Already-running agents can ask one another for work without a separate routing application. |
+| Shared ownership of work | The default CLI does not supply the Teams task-claim protocol; a multi-agent extension or controller must provide its own coordination. | [The task ledger](docs/agent-teams.md#task-protocol) checks claim/release/done against the caller and rejects a competing claim with the owner's name. Ownership is runtime state rather than a promise in a prompt; it does not lock source files. |
+| Approval before a teammate edits | Pi explicitly leaves plan mode out of the default CLI. A request to “plan first” alone is not an enforced tool gate. | [Plan approval](docs/agent-teams.md#plan-submission-and-approval) blocks disallowed tools until the lead approves the member's current plan revision. Stale approvals are refused; approval does not expand the member's existing permissions. |
+| Waiting and stopping | Pi exposes run lifecycle events, abort and orderly process shutdown through RPC. A controller supplies any team-level policy. | [Team notices](docs/agent-teams.md#idle-notices-and-messaging) wake idle agents when action is needed; [cooperative stop](docs/agent-teams.md#cooperative-stop) requests an acknowledgement from a member. The lead can coordinate completion without treating a whole terminal process as the unit of work. |
+| Traffic and spawn pressure | With no default subagent/team layer, Pi leaves these coordination policies to the chosen extension or host. | [Ingress guards](docs/settings.md#peer-messaging-guard-ircbus) bound message rate, duplicates and relay chains. Optional spawn refusal makes saturation explicit, and token-budget notices steer members toward finishing. These reduce specific coordination failure modes; they are not a hard spending cap. |
+| Resuming orchestration | Pi's [session resume and branching](https://github.com/earendil-works/pi/blob/9cd49d2c00ac446f774b878d25923bdb3739dadd/packages/coding-agent/docs/usage.md#continue-or-start-over) restore conversations. A multi-agent workflow needs its own execution bookkeeping. | The [workflow journal](docs/tools/workflow.md) replays completed agent calls and runs the unfinished tail. Conversation recovery and workflow recovery are separate mechanisms; this does not guarantee exactly-once external side effects. |
+
+### When this fork is the better fit
+
+Choose it when the job needs **several agents with explicit ownership, approval and delivery rules**, especially agents already running in separate local terminals. The advantage is an integrated coordination protocol: less routing and lifecycle code to build yourself, and decisions such as “who owns this task?” or “may this member edit yet?” checked by the runtime rather than left only in model instructions.
+
+Choose stock Pi when you want a minimal single-agent harness or prefer to select and maintain your own extensions. Its SDK, RPC and packages can support custom multi-agent systems; the comparison above is about what is integrated here, not what Pi could be extended to do.
+
+Teams must be enabled (`team.enabled: true`); spawn refusal and token budgets are opt-in. A2A is machine-local, the ledger lock covers one omp process, and plan gates are not an OS sandbox. The [live runs and recordings](#verified-live) demonstrate these mechanisms, **not a head-to-head benchmark against Pi**: no claim of better model accuracy, lower total token cost or faster completion is established.
+
 ## Mechanisms
 
 ### 1. Cross-terminal agents (A2A bridge)
