@@ -3,9 +3,18 @@
 ## [Unreleased]
 
 ### Added
+- Team members can set `model` and `thinking-level` in the team file; a member whose agent has no model of its own (and is not pinned to the `@task` role) now runs on the lead's active model instead of the `@task` role model
+- `/team approve` and `/team reject` accept `--team <name>` to pick the team when a handle exists in more than one
+- The `/team start` lead note states the initial state (members just spawned, empty task ledger, no plan submitted) so the lead need not read `team://` before its first notice
+- IRC delivery receipts report `queued` when a message is kept in the recipient's mailbox but not yet delivered to its session; a retry of that message stays refused as a duplicate instead of arriving twice
+- `bun run test:coordination` runs the offline A2A, Teams, IRC and worker-bridge suites, and `bun run eval:a2a --model <id>` runs a live two-terminal A2A exchange
+- The TypeScript suite fails fast with a rebuild hint when the loaded `pi_natives` addon lacks exports the generated bindings declare, instead of failing dozens of unrelated chunks
 
 ### Fixed
 
+- Explicit A2A replies correlate only with requests from the selected peer endpoint, so terminals sharing a name cannot consume each other's requests.
+- Team completion wakes an idle lead after reserved members finish registering; plan decisions through `team://` stay scoped to the selected team, generation, and member.
+- Worker mailbox overflow remains a delivery refusal across RPC and is never buffered; unbuffered failures allow retries, while messages retained in the mailbox report `queued` and keep duplicate protection for the configured deduplication window.
 - Fixed the fatal uncaught `Native shell returned an invalid execution trace` that killed whole sessions: a failed shell-trace poll (snapshot parse or wire-guard rejection) now logs a warning, keeps the last valid preview, and never aborts the session from inside the poll timer; the command still runs and returns normally
 - A team lead agent can decide a member's plan itself with `write team://<team>/plan/<member>` (`approve [--rev N]` or `reject [--rev N]: <reason>`), the same authority as `/team approve|reject`
 - `/team start` gives the lead a hidden protocol note for its next turn (roster, the members' instructions, channels, how to decide plans) and warns when a member's instructions name a tool its agent cannot call in the session

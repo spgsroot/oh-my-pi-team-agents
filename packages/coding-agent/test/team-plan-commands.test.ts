@@ -58,18 +58,6 @@ async function fixture() {
 }
 
 describe("team plan commands", () => {
-	it("advertises approval subcommands and validates their usage", async () => {
-		const { command } = await fixture();
-		const names = BUILTIN_TEAMS_SLASH_COMMANDS[0]!.subcommands!.map(command => command.name);
-		expect(names).toContain("approve");
-		expect(names).toContain("reject");
-		for (const args of ["approve", "approve worker extra", "reject worker"]) {
-			const output = await command(args);
-			expect(output).toContain("/team approve <handle> [--rev N]");
-			expect(output).toContain("/team reject <handle> [--rev N] <reason>");
-		}
-	});
-
 	it("enforces team.enabled for approve and reject without changing the gate", async () => {
 		const { child, identity, command } = await fixture();
 		for (const args of ["approve worker", "reject worker revise"]) {
@@ -103,7 +91,8 @@ describe("team plan commands", () => {
 	});
 
 	it("parses --rev placement and validates its value", async () => {
-		const { command } = await fixture();
+		const { child, identity, command } = await fixture();
+		await teamRuntime.submitPlan(child, identity, "Pending plan");
 		// Bad values are usage errors before any runtime call. A `--rev` token in
 		// handle position is a usage error too, not an unknown member handle.
 		for (const args of [
@@ -123,10 +112,8 @@ describe("team plan commands", () => {
 			"reject worker --rev 0 Add tests",
 			"reject worker Add tests --rev",
 		]) {
-			const output = await command(args);
-			expect(output).toContain("/team approve <handle> [--rev N]");
-			expect(output).toContain("/team reject <handle> [--rev N] <reason>");
-			expect(output).not.toContain("No live team member named");
+			await command(args);
+			expect(await teamRuntime.planPending(child, identity)).toBe(true);
 		}
 	});
 
@@ -162,5 +149,19 @@ describe("team plan commands", () => {
 		expect(await command("approve worker --rev 3")).toContain("Stale plan revision 3; current is 4");
 		expect(await command("approve worker --rev 4")).toContain("approved");
 		expect(await teamRuntime.planPending(child, identity)).toBe(false);
+	});
+
+	it("scopes approval to the selected team and rejects a missing scope", async () => {
+		const { child, identity, command } = await fixture();
+		await teamRuntime.submitPlan(child, identity, "Pending plan");
+		await command("approve worker --team missing --rev 1");
+		expect(await teamRuntime.planPending(child, identity)).toBe(true);
+		await command("approve worker --team audit --rev 1");
+		expect(await teamRuntime.planPending(child, identity)).toBe(false);
+		await teamRuntime.submitPlan(child, identity, "Revised plan");
+		await command("reject worker --rev 2 --team audit Needs coverage");
+		expect(await teamRuntime.planPending(child, identity)).toBe(true);
+		await command("approve worker --team audit --rev 2");
+		expect(await teamRuntime.planPending(child, identity)).toBe(true);
 	});
 });

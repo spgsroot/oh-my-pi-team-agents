@@ -36,7 +36,7 @@ import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.m
 import isolationRecoveryHintTemplate from "../prompts/tools/isolation-recovery-hint.md" with { type: "text" };
 import salvagedChildHintTemplate from "../prompts/tools/salvaged-child-hint.md" with { type: "text" };
 import { AgentRegistry, type AgentRegistryApi, MAIN_AGENT_ID } from "../registry/agent-registry";
-import { AUTO_THINKING, type TaskEffort } from "@oh-my-pi/pi-tui/thinking";
+import { AUTO_THINKING, type TaskEffort, type ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { ToolSession } from "../tools";
 import { normalizeToolNames } from "../tools/builtin-names";
 import { isIrcEnabled } from "../irc/messaging";
@@ -173,6 +173,7 @@ export interface StructuredSubagentRequest {
 	/** Marks a team spawn for prompt selection and coordination capability. */
 	teamIrc?: boolean;
 	teamIdentity?: TeamIdentity;
+	teamThinkingLevel?: ConfiguredThinkingLevel;
 	invokedAt?: number;
 	acquiredAt?: number;
 	isolation?: StructuredSubagentIsolationControls;
@@ -579,7 +580,11 @@ export async function resolveEffectiveSubagentPolicy(
 		request.teamIrc && agent.teamSystemPrompt !== undefined
 			? { ...agent, systemPrompt: agent.teamSystemPrompt }
 			: agent;
-	const effectiveAgent = planMode ? createPlanModeAgent(selectedAgent) : selectedAgent;
+	const teamAgent =
+		request.teamThinkingLevel === undefined
+			? selectedAgent
+			: { ...selectedAgent, thinkingLevel: request.teamThinkingLevel };
+	const effectiveAgent = planMode ? createPlanModeAgent(teamAgent) : teamAgent;
 	// An agent declaring `structured: true` keeps its result contract when the caller opts out (`task.structured` off).
 	const structured = request.structured !== false || effectiveAgent.structured === true;
 	const schema = resolveSchema(request, effectiveAgent, structured);
@@ -634,7 +639,13 @@ export async function resolveEffectiveSubagentPolicy(
 	const modelResolution = {
 		requestModel: preparedSeance?.modelPatterns ?? request.model,
 		settingsOverride: hasPreparedSeance ? undefined : agentModelOverrides[agentName],
-		agentModel: hasPreparedSeance ? undefined : effectiveAgent.model,
+		agentModel: hasPreparedSeance
+			? undefined
+			: request.teamIrc &&
+				  (!effectiveAgent.model?.length ||
+						(effectiveAgent.model.length === 1 && effectiveAgent.model[0] === "@task"))
+				? (parentActiveModelPattern ?? effectiveAgent.model)
+				: effectiveAgent.model,
 		settings: request.session.settings,
 		activeModelPattern: parentActiveModelPattern,
 		fallbackModelPattern: hasPreparedSeance ? undefined : request.session.getModelString?.(),

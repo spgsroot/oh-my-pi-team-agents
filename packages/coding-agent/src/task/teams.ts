@@ -13,6 +13,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger, parseFrontmatter, prompt } from "@oh-my-pi/pi-utils";
+import { CLI_THINKING_LEVELS, type ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { getConfigDirs, findAllNearestProjectConfigDirs } from "../config";
 import teamTaskProtocolTemplate from "../prompts/system/team-task-protocol.md" with { type: "text" };
 import { sanitizeAgentId } from "./name-generator";
@@ -27,6 +28,9 @@ export interface TeamMember {
 	role?: string;
 	/** Override the team's plan-approval requirement, including explicit false. */
 	planApproval?: boolean;
+	/** Explicit model selector; otherwise the agent or lead supplies it. */
+	model?: string;
+	thinkingLevel?: ConfiguredThinkingLevel;
 }
 
 /** A parsed team file. */
@@ -88,11 +92,23 @@ export function parseTeamFile(contents: string, filePath: string): TeamDefinitio
 			logger.warn(`team file ${filePath}: member 'handle' is required; skipped member`);
 			continue;
 		}
+		if ("model" in record && (typeof record.model !== "string" || !record.model.trim())) {
+			logger.warn(`team file ${filePath}: member model must be a non-empty selector; skipped team`);
+			return undefined;
+		}
+		if ("thinking-level" in record && !CLI_THINKING_LEVELS.some(level => level === record["thinking-level"])) {
+			logger.warn(`team file ${filePath}: invalid member thinking-level; skipped team`);
+			return undefined;
+		}
 		members.push({
 			agent: record.agent.trim(),
 			handle: record.handle.trim(),
 			...(typeof record.role === "string" && record.role.trim().length > 0 ? { role: record.role.trim() } : {}),
 			...(typeof record.planApproval === "boolean" ? { planApproval: record.planApproval } : {}),
+			...(typeof record.model === "string" ? { model: record.model.trim() } : {}),
+			...(typeof record["thinking-level"] === "string"
+				? { thinkingLevel: record["thinking-level"] as ConfiguredThinkingLevel }
+				: {}),
 		});
 	}
 	if (members.length === 0) {

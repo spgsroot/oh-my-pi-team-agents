@@ -35,8 +35,8 @@ const USAGE = [
 	"  /team list                         show discovered team files",
 	"  /team status [name]                member handles + live registry status",
 	"  /team stop [--force] <name|handle|all>  request stop (or force release)",
-	"  /team approve <handle> [--rev N]   approve a submitted member plan",
-	"  /team reject <handle> [--rev N] <reason>  reject a plan and require resubmission",
+	"  /team approve <handle> [--team name] [--rev N]   approve a submitted member plan",
+	"  /team reject <handle> [--team name] [--rev N] <reason>  reject a plan and require resubmission",
 ].join("\n");
 
 function teamRuntimeError(message: string): string {
@@ -151,22 +151,34 @@ export const BUILTIN_TEAMS_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				const handle = words.shift();
 				// A `--rev` token in handle position is a usage error, not a handle:
 				// `/team approve --rev 1` must reach usage, not an unknown-member error.
-				if (handle === "--rev") return usage(USAGE, runtime);
+				if (handle?.startsWith("--")) return usage(USAGE, runtime);
 				let revision: number | undefined;
-				if (words[0] === "--rev") {
-					words.shift();
+				let teamName: string | undefined;
+				while (words[0]?.startsWith("--")) {
+					const flag = words.shift();
 					const value = words.shift();
-					if (!value || !/^[1-9][0-9]*$/.test(value)) return usage(USAGE, runtime);
-					revision = Number(value);
+					if (!value || value.startsWith("--")) return usage(USAGE, runtime);
+					if (flag === "--rev" && revision === undefined && /^[1-9][0-9]*$/.test(value)) {
+						revision = Number(value);
+					} else if (flag === "--team" && teamName === undefined) {
+						teamName = value;
+					} else return usage(USAGE, runtime);
 				}
 				const reason = words.join(" ");
 				if (!handle || (verb === "approve" ? reason !== "" : reason === "")) return usage(USAGE, runtime);
-				if (words.includes("--rev")) return usage(USAGE, runtime);
+				if (words.includes("--rev") || words.includes("--team")) return usage(USAGE, runtime);
 				try {
 					const client = getTeamClient();
 					const key = runtime.session.instanceKey;
-					if (verb === "approve") await client.approve(key, handle, revision);
-					else await client.reject(key, handle, reason, revision);
+					let identity;
+					if (teamName !== undefined) {
+						const roster = await client.members(key, teamName);
+						const member = roster?.members.find(([name, entry]) => name === handle || entry.id === handle);
+						if (!roster || !member) throw new Error(`No member "${handle}" in team "${teamName}"`);
+						identity = { team: teamName, generation: roster.generation, memberId: member[1].id };
+					}
+					if (verb === "approve") await client.approve(key, handle, revision, identity);
+					else await client.reject(key, handle, reason, revision, identity);
 					await runtime.output(`${handle}: plan ${verb === "approve" ? "approved" : "rejected"}`);
 				} catch (error) {
 					await runtime.output(teamRuntimeError(error instanceof Error ? error.message : String(error)));
@@ -340,6 +352,8 @@ export const BUILTIN_TEAMS_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 					try {
 						const ref = await spawnSubagentForSession(runtime.session, {
 							agent: member.agent,
+							...(member.model !== undefined ? { model: member.model } : {}),
+							...(member.thinkingLevel !== undefined ? { thinkingLevel: member.thinkingLevel } : {}),
 							prompt: renderTeamMemberPrompt(team, assignment),
 							context: renderTeamMemberContext({ ...team, members }, member, ids, availableTools.get(member)),
 							handle,

@@ -78,6 +78,8 @@ Optional fields:
 | `tasks` | Initial list of non-empty, single-line task titles, in ID order. An empty list is valid. Only seeds a newly created ledger. |
 | `planApproval` | YAML boolean requiring approval for all members when `true`; omitted means no requirement. |
 | Member `planApproval` | YAML boolean overriding the team value, including explicit `false`. Invalid boolean values cause the team file to be skipped. |
+| Member `model` | Optional model selector for that member. Without it, a member whose agent definition has no model of its own (and is not pinned to the `@task` role) uses the lead's active model. An empty value causes the team file to be skipped. |
+| Member `thinking-level` | Optional thinking level for that member (any CLI thinking level, e.g. `high`). Without it, the agent definition's own level applies, else the lead's. |
 
 Handles use the registry's `sanitizeAgentId` normalization, including its
 48-character cap. Handles that collide after normalization within the selected
@@ -368,10 +370,11 @@ as a grant.
 `approve`, `approve --rev N`, `reject: <reason>` or `reject --rev N: <reason>`;
 anything else is refused with that usage. It is authorized exactly like the
 commands: only the session that leads the URL's team may write it, and the
-member must belong to that team.
+member must belong to that team. The decision retains the team's generation
+and member ID through RPC; identical handles in other teams do not interfere.
 
-Only the current lead can approve/reject its members. Ambiguous handles,
-nonmembers, stale generations and replaced refs are refused. The revision
+Only the current lead can approve/reject its members. Unscoped slash commands
+refuse ambiguous handles; nonmembers, stale generations and replaced refs are refused. The revision
 `N` counts accepted submissions in the member's current generation (1, 2, 3
 …); rejects do not advance it, so the resubmission after a rejected rev 2 is
 rev 3. With `--rev N` the decision is a compare-and-set: if `N` differs from
@@ -397,9 +400,11 @@ All `/team` commands require `team.enabled: true`.
 /team start <name> [assignment]
 /team status [name]
 /team stop [--force] <name|handle|all>
-/team approve <handle> [--rev N]
-/team reject <handle> [--rev N] <reason>
+/team approve <handle> [--team name] [--rev N]
+/team reject <handle> [--team name] [--rev N] <reason>
 ```
+
+`--team` names the team when the same handle exists in more than one team; without it, an ambiguous handle is refused. Use the `team://<team>/plan/<member>` path to decide a plan in a specific team.
 
 | Setting | Default | Purpose |
 |---|---|---|
@@ -423,6 +428,12 @@ lead and a plan-gated member add a function to a scratch project — and scores
 its transcripts with the same metric. It needs model credentials, so it is not
 part of the unit suites; run it when changing team prompts, notices or the
 protocol.
+
+`bun run eval:a2a --model <provider/id>` runs two real omp terminals: the lead
+spawns the other terminal's agent with the task tool and must receive its answer
+through the reply job. It exits 0 on success, 1 when the answer did not arrive,
+and 2 when the model call itself failed. `bun run test:coordination` runs the
+offline A2A, Teams, IRC and worker-bridge suites (about 15 seconds).
 
 ## Source
 

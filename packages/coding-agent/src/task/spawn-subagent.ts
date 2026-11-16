@@ -10,6 +10,7 @@
  */
 
 import { logger } from "@oh-my-pi/pi-utils";
+import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { assertNotRemoteA2aAgent } from "../a2a/agent-bridge";
 import type { SpawnSubagentOptions } from "../extensibility/extensions/types";
 import { AgentRegistry, type AgentRef, type AgentRegistryApi } from "../registry/agent-registry";
@@ -69,6 +70,8 @@ export interface TeamSpawnSubagentOptions extends SpawnSubagentOptions {
 	/** An ID reserved for this team before contexts were rendered. */
 	teamReservedId?: string;
 	teamIdentity?: TeamIdentity;
+	model?: string;
+	thinkingLevel?: ConfiguredThinkingLevel;
 }
 
 /**
@@ -117,6 +120,8 @@ export async function spawnSubagentViaExecutor(
 			agent: options.agent,
 			identity: { id, label: options.handle ?? options.agent },
 			context: options.context,
+			...(options.model !== undefined ? { model: options.model } : {}),
+			...(options.thinkingLevel !== undefined ? { teamThinkingLevel: options.thinkingLevel } : {}),
 			...(options.teamWorkspace !== undefined ? { teamWorkspace: options.teamWorkspace } : {}),
 			...(options.teamIrc === true ? { teamIrc: true } : {}),
 			...(options.teamIdentity !== undefined ? { teamIdentity: options.teamIdentity } : {}),
