@@ -60,6 +60,8 @@ Audit covers services X and Y; the lead collects the final report.
 5. Request `/team stop audit`, or use `/team stop --force audit` for immediate
    release. See [Cooperative stop](#cooperative-stop) for responses and timeouts.
 
+![Team lead starts a three-member team; Dev, Tester and Reviewer claim tasks in the ledger (right), reproduce and fix a race in claim_next(), and the lead summarizes](./media/agent-teams.gif)
+
 ## Team definitions and startup
 
 Team files are discovered in project `.omp/teams/<name>.md` and user
@@ -168,6 +170,8 @@ the owner and records the body verbatim as the note. A done task cannot be
 claimed until its owner or lead releases it. Added titles are trimmed, non-empty
 and single-line; multi-line completion notes remain intact, with continuation
 lines indented in the generated view.
+
+![The lead's claim on task 1 is refused with `Task 1 is owned by Dev`; `tasks.json` keeps the owner](./media/team-claim-conflict.gif)
 
 ### Persistence and migration
 
@@ -317,6 +321,8 @@ ordinary delivery/queue checks; this is not an unrestricted messaging bypass,
 and the `teamControl` flag is set only by runtime code — an agent cannot claim
 the exemption through any tool.
 
+![`/team stop jobqueue`: Dev acknowledges the request and the lead gets `Team jobqueue finished: no members left.`](./media/cooperative-stop.gif)
+
 ## Plan submission and approval
 
 Until approval, the exact allowed tool names are `read`, `grep`, `glob`, `find`,
@@ -393,6 +399,10 @@ Approval and rejection change gate state before sending their notifications.
 If that delivery fails, the command reports that the plan was approved/rejected
 but the notification failed; it does not roll back the decision.
 
+![Plan gate: Dev submits a plan, the lead approves it through `team://`, and the file changes only after the approval](./media/team-plan-gate.gif)
+
+![Stale revision: `/team approve Dev --rev 1` is refused with `Stale plan revision 1; current is 2`, then rev 2 is approved](./media/plan-stale-rev.gif)
+
 ## Commands and settings
 
 All `/team` commands require `team.enabled: true`.
@@ -432,6 +442,8 @@ the lead, after ending its turn, woke on the member's final notice and reported
 after the edit. It needs model credentials, so it is not
 part of the unit suites; run it when changing team prompts, notices or the
 protocol.
+
+![`bun run metric:team-coordination` over the team clip transcripts: discovery 0, coordination 31, work 23](./media/coordination-metric.gif)
 
 `bun run eval:a2a --model <provider/id>` runs two real omp terminals: the lead
 spawns the other terminal's agent with the task tool and must receive its answer

@@ -49,7 +49,7 @@ sequenceDiagram
 
 Протокол и настройки: [docs/a2a.md](docs/a2a.md).
 
-![Итог: reviewer (слева) ответил, builder (справа) показывает ответ](docs/media/a2a-reply.png)
+![Итог: builder (слева) показывает ответ, пришедший от a2a:reviewer (справа)](docs/media/a2a-reply.png)
 
 ### 2. Agent Teams (внутри сессии)
 
@@ -81,7 +81,7 @@ Review src/invoice.ts and src/money.ts.
 ```
 
 <p align="center">
-  <img src="docs/media/agent-teams.gif" alt="Лид запускает /team start review; Scout и Reviewer переписываются и сообщают подтверждённые находки" width="760">
+  <img src="docs/media/agent-teams.gif" alt="Лид запускает команду из трёх участников; Dev, Tester и Reviewer берут задачи в реестре (справа), воспроизводят и чинят гонку в claim_next(), лид подводит итог" width="760">
 </p>
 
 `/team list`, `/team status`, `/team stop [--force] <имя|хэндл|all>`, `/team approve|reject <хэндл> [--team <имя>] [--rev N]`. Включение: `team.enabled: true`; не больше `team.maxTeammates` участников (по умолчанию 4). Подробности: [docs/agent-teams.md](docs/agent-teams.md).
@@ -160,6 +160,34 @@ sequenceDiagram
 На `openai-codex/gpt-6.1-sol:high` те же прогоны не дали результата: у провайдера не было активных аккаунтов (`no_accounts`, `previous_response_owner_unavailable`). Ошибку провайдера скрипты возвращают кодом 2, а не выдают за провал протокола.
 
 Тесты механизмов: `bun run test:coordination` (офлайн-наборы A2A, Teams, IRC и worker-bridge, около 15 с), а также `test/workflow.test.ts`, `test/token-budget.test.ts`, `test/handback.test.ts`, `test/capability-token.test.ts`. Живые прогоны требуют ключей модели: `bun run eval:a2a --model <id>`, `bun run eval:team-coordination --model <id>`.
+
+### Видеозаписи
+
+Записано 2026-11-16 на сборке `248a51175d`, модель `anthropic/claude-sonnet-5-5`, настоящие терминалы. Клип A2A в начале страницы и клип команды в разделе [Agent Teams](#2-agent-teams-внутри-сессии) из той же серии. GIF здесь только превью, 4K MP4 в репозитории нет. Мышление везде `high`, кроме клипа команды с реестром и клипа с метрикой (`low`).
+
+**Конфликт claim.** Dev забирает задачу 1, а claim самого лида отклоняется: `Task 1 is owned by Dev`. В `tasks.json` остаётся `"owner": "Dev"`.
+
+<p align="center"><img src="docs/media/team-claim-conflict.gif" alt="Claim лида на задачу 1 отклонён, потому что её держит Dev; файл реестра не меняется" width="760"></p>
+
+**Ingress-гард.** Лид за один ход отправляет три `write agent://Dev`. Первое сообщение доставлено. Второе отклонено по частоте (`rate limited: "Main" may send 30 tokens per 500 ms`), повтор первого отклонён как дубликат в окне 30000 мс.
+
+<p align="center"><img src="docs/media/ingress-refusal.gif" alt="Три параллельных сообщения Dev: одно доставлено, одно отклонено по частоте, одно как дубликат" width="760"></p>
+
+**Гейт плана.** Dev отправляет план через `write team://gate/plan`, лид утверждает его через `write team://gate/plan/Dev`. Наблюдатель за файлами показывает, что `jobqueue.py` не тронут до утверждения и меняется примерно через две секунды после него. Потом лид сам запускает тест и закрывает задачу. В уведомлении о простоте на клипе цитируется первая строка хода Dev (`Submit plan first.`), а не его итоговый отчёт.
+
+<p align="center"><img src="docs/media/team-plan-gate.gif" alt="Участник под гейтом плана: план отправлен, лид утвердил, файл изменился только после утверждения, лид проверил и доложил" width="760"></p>
+
+**Устаревшая ревизия плана.** Пользователь отклоняет rev 1, Dev присылает rev 2, а `/team approve Dev --rev 1` отвечает `Stale plan revision 1; current is 2`. Утверждение rev 2 проходит.
+
+<p align="center"><img src="docs/media/plan-stale-rev.gif" alt="Утверждение устаревшей ревизии плана отклонено, актуальная ревизия утверждена" width="760"></p>
+
+**Кооперативная остановка.** `/team stop jobqueue` просит Dev остановиться, Dev подтверждает, лид получает `Team jobqueue finished: no members left.`
+
+<p align="center"><img src="docs/media/cooperative-stop.gif" alt="Кооперативная остановка: запрос, подтверждение Dev, уведомление о завершении команды" width="760"></p>
+
+**Метрика координации.** `bun run metric:team-coordination` по транскриптам клипа команды: 31 вызов координации, 23 рабочих, ни одного discovery, доля discovery 0,0 % (порог 10 %).
+
+<p align="center"><img src="docs/media/coordination-metric.gif" alt="Вывод метрики для прогона команды: discovery 0, coordination 31, work 23" width="760"></p>
 
 ## Быстрый старт
 

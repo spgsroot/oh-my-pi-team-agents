@@ -47,7 +47,7 @@ sequenceDiagram
 
 Wire contract and settings: [docs/a2a.md](docs/a2a.md).
 
-![Final state: reviewer (left) answered, builder (right) shows the answer](docs/media/a2a-reply.png)
+![Final state: builder (left) shows the answer relayed from a2a:reviewer (right)](docs/media/a2a-reply.png)
 
 ### 2. Agent Teams (in-session)
 
@@ -83,7 +83,7 @@ Review src/invoice.ts and src/money.ts.
 ```
 
 <p align="center">
-  <img src="docs/media/agent-teams.gif" alt="Team lead runs /team start review; Scout and Reviewer message each other and report confirmed findings" width="760">
+  <img src="docs/media/agent-teams.gif" alt="Team lead starts a three-member team; Dev, Tester and Reviewer claim tasks in the ledger (right), reproduce and fix a race in claim_next(), and the lead summarizes" width="760">
 </p>
 
 `/team list`, `/team status`, `/team stop [--force] <name|handle|all>`, `/team approve|reject <handle> [--team <name>] [--rev N]`. Enable with `team.enabled: true`; at most `team.maxTeammates` (default 4) members. Details: [docs/agent-teams.md](docs/agent-teams.md).
@@ -162,6 +162,34 @@ Re-run on 2026-11-16 after the coordination review: Windows 11, source build, `a
 The same evals on `openai-codex/gpt-6.1-sol:high` were inconclusive: the provider had no active accounts (`no_accounts`, `previous_response_owner_unavailable`); the scripts exit 2 for a provider failure instead of reporting it as a protocol failure.
 
 Mechanism suites: `bun run test:coordination` (offline A2A, Teams, IRC and worker-bridge suites, about 15 s), plus `test/workflow.test.ts`, `test/token-budget.test.ts`, `test/handback.test.ts`, `test/capability-token.test.ts`. Live evals need model credentials: `bun run eval:a2a --model <id>`, `bun run eval:team-coordination --model <id>`.
+
+### Screen recordings
+
+Recorded on 2026-11-16 on the build at `248a51175d` with `anthropic/claude-sonnet-5-5`, in real terminals. The A2A clip at the top and the team clip in [Agent Teams](#2-agent-teams-in-session) come from the same series. The GIFs are previews; the 4K MP4 originals are not stored in this repository. Thinking level is `high` except for the team clip with the ledger and the metric clip (`low`).
+
+**Claim conflict.** Dev claims task 1; the lead's own claim is refused with `Task 1 is owned by Dev`, and `tasks.json` keeps `"owner": "Dev"`.
+
+<p align="center"><img src="docs/media/team-claim-conflict.gif" alt="The lead's claim on task 1 is refused because Dev owns it; the ledger file does not change" width="760"></p>
+
+**Ingress guard.** The lead sends three `write agent://Dev` calls in one turn. The first is delivered. The second is refused (`rate limited: "Main" may send 30 tokens per 500 ms`), and a repeat of the first is refused as a duplicate within 30000 ms.
+
+<p align="center"><img src="docs/media/ingress-refusal.gif" alt="Three parallel messages to Dev: one delivered, one refused by the rate limit, one refused as a duplicate" width="760"></p>
+
+**Plan gate.** Dev submits a plan through `write team://gate/plan`, the lead approves it through `write team://gate/plan/Dev`. The file watcher shows `jobqueue.py` untouched until the approval and changed about two seconds later. The lead then re-runs the test and closes the task. The idle notice in the clip quotes Dev's first line (`Submit plan first.`), not its final report.
+
+<p align="center"><img src="docs/media/team-plan-gate.gif" alt="Plan-gated member: plan submitted, lead approves, the file changes only after approval, lead verifies and reports" width="760"></p>
+
+**Stale plan revision.** The user rejects rev 1, Dev resubmits as rev 2, and `/team approve Dev --rev 1` fails with `Stale plan revision 1; current is 2`. Approving rev 2 succeeds.
+
+<p align="center"><img src="docs/media/plan-stale-rev.gif" alt="Approving an outdated plan revision is refused; the current revision is approved" width="760"></p>
+
+**Cooperative stop.** `/team stop jobqueue` asks Dev to stop, Dev acknowledges, and the lead gets `Team jobqueue finished: no members left.`
+
+<p align="center"><img src="docs/media/cooperative-stop.gif" alt="Cooperative stop: the stop request, Dev's acknowledgement, the team finished notice" width="760"></p>
+
+**Coordination metric.** `bun run metric:team-coordination` over the transcripts of the team clip: 31 coordination calls, 23 work calls, no discovery calls, discovery share 0.0 % (limit 10 %).
+
+<p align="center"><img src="docs/media/coordination-metric.gif" alt="The coordination metric output for the team run: discovery 0, coordination 31, work 23" width="760"></p>
 
 ## Quick start
 

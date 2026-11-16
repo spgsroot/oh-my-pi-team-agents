@@ -101,6 +101,8 @@ task(agent: "a2a:A2aIdleProbe", task: "Reply with the final count", wait: true)
 Manual commands: `/a2a auto` (re-scan the bridge registry), `/a2a add <url>
 --token <t>`, `/a2a list`, `/a2a remove <name>`.
 
+![Two omp terminals: builder asks a2a:reviewer a question, reviewer answers, and the answer returns to builder](./media/a2a-cross-terminal.gif)
+
 ## Addressing and delivery
 
 Each terminal writes **one file per process**,
