@@ -12,7 +12,7 @@ A research fork of [oh-my-pi](https://github.com/can1357/oh-my-pi) (`omp`) about
 
 The companion article [**Inside Claude Code: how agents talk and how Agent Teams work**](https://llmcrew.org/wiki/claude-code-agent-teams-internals) (RU, Claude Code 2.1.311, static analysis of the binary) reconstructs Claude Code's agent messaging: `SendMessage` routing, file-backed teammate mailboxes, report hand-back, recovery, limits and trust boundaries.
 
-This fork is the hands-on half of that research: the same problems implemented in an open agent, then exercised with real terminals and models. Every mechanism below is runnable and was checked live (see [Verified live](#verified-live)).
+This fork is the hands-on half of that research: the same problems implemented in an open agent, then exercised with real terminals and models. Almost every mechanism below was checked live; the exceptions are marked in the table (see [Verified live](#verified-live)).
 
 | Problem | Claude Code 2.1.311 (per the article) | This fork |
 |---|---|---|
