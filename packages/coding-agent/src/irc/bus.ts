@@ -163,6 +163,8 @@ export class IrcBus implements IrcBusApi {
 	 * until a plan decision answers it; see {@link unansweredSends}.
 	 */
 	readonly #planAsks = new Map<string, Map<string, SendMark>>();
+	/** The latest plan decision per lead → member: the only answer to a pending {@link #planAsks} entry. */
+	readonly #planDecisions = new Map<string, Map<string, SendMark>>();
 	/** Last {@link SendMark.seq} handed out, taken when a send starts. */
 	#sendSeq = 0;
 
@@ -231,6 +233,7 @@ export class IrcBus implements IrcBusApi {
 				this.#record(this.#planAsks, message.from, message.to, mark);
 			} else if (message.planDecision) {
 				this.#record(this.#lastSent, message.from, message.to, mark);
+				this.#record(this.#planDecisions, message.from, message.to, mark);
 			}
 		}
 		if (receipt.outcome !== "failed" && !message.teamNotice) {
@@ -331,8 +334,15 @@ export class IrcBus implements IrcBusApi {
 			if (sent.ts < sinceTs) continue;
 			const after = (table: Map<string, Map<string, SendMark>>) => (table.get(to)?.get(from)?.seq ?? 0) > sent.seq;
 			// A pending plan submission is promised: the lead owes its decision
-			// whether or not it is running when the member waits.
-			const promised = after(this.#lastProgress) || this.#planAsks.get(from)?.get(to)?.seq === sent.seq;
+			// whether or not it is running when the member waits, and only that
+			// decision answers it. An ordinary message from the lead (a nudge to
+			// submit, a question) leaves the decision owed.
+			const planAsk = this.#planAsks.get(from)?.get(to)?.seq === sent.seq;
+			if (planAsk) {
+				if (!after(this.#planDecisions)) unanswered.push({ to, sentAt: sent.ts, promised: true });
+				continue;
+			}
+			const promised = after(this.#lastProgress);
 			if (after(this.#lastSent) || (!promised && after(this.#lastJobReply))) continue;
 			unanswered.push({ to, sentAt: sent.ts, promised });
 		}

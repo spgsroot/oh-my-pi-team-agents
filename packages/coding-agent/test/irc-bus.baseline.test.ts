@@ -214,6 +214,12 @@ describe("IrcBus baseline", () => {
 		await bus.send({ from: "0-Lead", to: "0-Mem", body: "Stop requested", progress: true, teamNotice: true });
 		expect(bus.unansweredSends("0-Mem", t0)).toHaveLength(1);
 
+		// Nor does an ordinary message from the lead: a nudge such as "submit
+		// your plan" still leaves the decision owed (a live run read it as the
+		// answer, so the member's `wait` returned at once and it polled).
+		await bus.send({ from: "0-Lead", to: "0-Mem", body: "Submit your plan now" });
+		expect(bus.unansweredSends("0-Mem", t0)).toEqual([{ to: "0-Lead", sentAt: expect.any(Number), promised: true }]);
+
 		await bus.send({
 			from: "0-Lead",
 			to: "0-Mem",
