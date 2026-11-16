@@ -17,12 +17,12 @@ This fork is the hands-on half of that research: the same problems implemented i
 | Problem | Claude Code 2.1.311 (per the article) | This fork |
 |---|---|---|
 | Two separately started sessions | `local-session` route: JSONL over a Unix domain socket, session file `~/.claude/sessions/<pid>.json` | A2A v1.0 bridge: JSON-RPC 2.0 over HTTP on `127.0.0.1`, bearer token, per-process registry file `a2a-bridges/<pid>.json` |
-| Teammate messaging | File mailboxes `~/.claude/teams/<team>/inboxes/<agent>.json` | In-process IRC bus, `write agent://<handle>`, with an ingress guard |
+| Teammate messaging | File mailboxes `~/.claude/teams/<team>/inboxes/<agent>.json` | In-process IRC bus, `write agent://<handle>`, with an ingress guard; a hand-off that cannot reach the session is kept in the recipient's mailbox and reported `queued` |
 | Team definition | Runtime state in `config.json`, rewritten by the harness | Declarative file `.omp/teams/<name>.md`, started with `/team start` |
-| Shared task list | `~/.claude/tasks/<team>/` | `TASKS.md` in the team workspace; claims are a convention, not a lock |
+| Shared task list | `~/.claude/tasks/<team>/` | `team://<team>/tasks` ledger: atomic claim / release / done checked against the caller's session; `tasks.json` is authoritative, `TASKS.md` a generated view |
 | Report back to the caller | `SubagentHandback`: one report, indentation framing | `handback` tool: one report per run, "model output, not user text" frame, harness-tag escaping |
 | Who a peer message speaks as | Envelope `cross-session-message`; local hash ledger (not a signature) | A peer terminal's request is a **user** turn, never a developer message; harness tags in the body are escaped |
-| Team control protocol | `shutdown_*`, `plan_approval_*`, `idle_notification` | Not implemented |
+| Team control protocol | `shutdown_*`, `plan_approval_*`, `idle_notification` | Plan approval gate (`write team://<team>/plan`, decided by the lead), idle and "team finished" notices, cooperative stop (`team://<team>/stop/<id>`) |
 
 ## Mechanisms
 
@@ -51,7 +51,7 @@ Wire contract and settings: [docs/a2a.md](docs/a2a.md).
 
 ### 2. Agent Teams (in-session)
 
-A team file declares members, handles, a shared workspace and the protocol they follow. `/team start <name>` spawns every member as a full subagent with a stable handle; members message each other directly with `agent://<handle>` and coordinate through `TASKS.md`.
+A team file declares members, handles, an optional workspace and task list, and the protocol they follow. `/team start <name>` spawns every member as a kept-alive subagent with a stable handle; members message each other with `agent://<handle>` and coordinate through the `team://<team>` protocol.
 
 Team files are discovered from two scopes; on a name collision the project file wins:
 
@@ -86,10 +86,33 @@ Review src/invoice.ts and src/money.ts.
   <img src="docs/media/agent-teams.gif" alt="Team lead runs /team start review; Scout and Reviewer message each other and report confirmed findings" width="760">
 </p>
 
-`/team list`, `/team status`, `/team stop [name|all]`. Enable with `team.enabled: true`; at most `team.maxTeammates` (default 4) members. Details: [docs/agent-teams.md](docs/agent-teams.md).
+`/team list`, `/team status`, `/team stop [--force] <name|handle|all>`, `/team approve|reject <handle> [--team <name>] [--rev N]`. Enable with `team.enabled: true`; at most `team.maxTeammates` (default 4) members. Details: [docs/agent-teams.md](docs/agent-teams.md).
+
+How a plan-gated team run goes:
+
+```mermaid
+sequenceDiagram
+    participant U as user
+    participant L as lead
+    participant M as member
+    U->>L: /team start calc
+    Note over L: hidden protocol note: roster, task ledger, channels
+    L-->>U: ends its turn
+    M->>L: write team://calc/plan (team notice, wakes the lead)
+    Note over M: wait blocks until the decision
+    L->>M: write team://calc/plan/Builder "approve --rev 1"
+    M->>M: edit, then handback
+    M-->>L: idle notice that leaves the team quiet (wakes the lead)
+    L-->>U: reports the result
+```
+
+- **`team://<team>`** is the whole protocol: `read` the overview (roster, live status, plans) or `/tasks`; `write` `/tasks` (lead adds), `/tasks/<id>/claim|release|done`, `/plan` (member submits), `/plan/<member>` (lead decides), `/stop/<id>` (member answers a stop). Every call is checked against the caller's trusted session; a guessed path is refused with the list of valid ones.
+- **Notices wake, `wait` does not poll.** Plan submissions, plan decisions, "team finished" and the idle notice that leaves the whole team quiet wake an idle lead or member; other idle notices fold into the next turn. `wait` blocks only on the caller's own jobs and services or on a reply it asked for. A plan submission counts as asked: only the lead's approval or rejection answers it, so an ordinary message from the lead in between does not end the member's wait for good. A lead waits for its members by ending its turn.
+- **Delivery receipts** name what happened to an `agent://` message: `injected`, `woken`, `revived`, `queued` (kept in the mailbox; a retry is refused as a duplicate) or `failed` (nothing kept; a retry is allowed).
+- **Per-member model:** `model` and `thinking-level` in the team file; without them a member whose agent has no model of its own runs on the lead's active model.
 
 > [!IMPORTANT]
-> Pick member definitions that may write and talk. A member's own definition prompt outranks the team context: the bundled read-only `scout` refuses to touch `TASKS.md`, and the structured-output `reviewer` reports through its own schema instead of messaging peers. The general `task` agent follows the team protocol.
+> A member's own definition prompt outranks the team context. Read-only definitions join only through a team prompt (the bundled `scout` and `reviewer` ship one) and get coordination-only write to `agent://` and `team://`, never disk.
 
 ### 3. Guards for agent-to-agent traffic
 
@@ -120,7 +143,7 @@ Run on 2026-11-08: Windows 11, binary built from `main`, model `openai-codex/gpt
 | A2A, never-prompted receiver | Same request into a fresh terminal | Failed 3 of 3 before `b7c805f4fb` (request arrived as a developer message, model asked "what would you like me to do?"); answered after the fix |
 | A2A plain-text answer | Receiver answers in its own chat instead of calling `task` | Relayed to the requester with `inReplyTo` |
 | Agent Teams | `/team start review`, `/team status` | Both members claimed rows in `TASKS.md`, Scout and Reviewer messaged each other, Scout reported confirmed findings |
-| Agent Teams with `scout`/`reviewer` definitions | Same team, bundled definitions | Members ignored the team protocol (see the note above) |
+| Agent Teams with `scout`/`reviewer` definitions | Same team, bundled definitions | Members ignored the team protocol. The bundled team prompts added afterwards (see the note above) target this; not re-run live |
 | Workflow resume | Two-phase script killed mid-run, resumed with `resumeFrom` | Completed calls replayed from the journal, only the unfinished call ran |
 | Refuse policy | `maxConcurrency: 1`, three parallel scouts | One ran, two refused with "Do not retry" |
 | Token budget | 30 000-token budget, subagent reads every file | `<total_tokens>13896 tokens left of 30000</total_tokens>` injected |
@@ -129,7 +152,16 @@ Run on 2026-11-08: Windows 11, binary built from `main`, model `openai-codex/gpt
 | chrome-mcp | List windows and tabs | Real Chrome windows listed |
 | Capability token on kill | `proc://<agent>/kill` | Not triggered live (the agent's transcript was already on disk, so no unsaved work); covered by `test/capability-token.test.ts` |
 
-Mechanism suites: `test/a2a-*.test.ts`, `test/session/irc-bridge-relay.test.ts`, `test/irc-*.test.ts`, `test/teams.test.ts`, `test/workflow.test.ts`, `test/token-budget.test.ts`, `test/handback.test.ts`, `test/capability-token.test.ts`.
+Re-run on 2026-11-16 after the coordination review: Windows 11, source build, `anthropic/claude-sonnet-5-5:high`, scripted RPC sessions.
+
+| Mechanism | Scenario | Result |
+|---|---|---|
+| A2A between two processes | `bun run eval:a2a`: the lead spawns the peer terminal's agent through `task`; the answer must come back through the reply job | Pass |
+| Plan-gated team | `bun run eval:team-coordination`: member submits a plan, lead approves through `team://`, member edits, lead wakes on the final notice and reports | 7 of 7 pass (the last 3 with the stricter check that the lead's post-edit reply names `sub`): change landed, discovery share 0 %, 3-4 coordination calls per run (10-13 before the prompt and `wait` fixes) |
+
+The same evals on `openai-codex/gpt-6.1-sol:high` were inconclusive: the provider had no active accounts (`no_accounts`, `previous_response_owner_unavailable`); the scripts exit 2 for a provider failure instead of reporting it as a protocol failure.
+
+Mechanism suites: `bun run test:coordination` (offline A2A, Teams, IRC and worker-bridge suites, about 15 s), plus `test/workflow.test.ts`, `test/token-budget.test.ts`, `test/handback.test.ts`, `test/capability-token.test.ts`. Live evals need model credentials: `bun run eval:a2a --model <id>`, `bun run eval:team-coordination --model <id>`.
 
 ## Quick start
 
@@ -165,8 +197,8 @@ Build details, upstream sync and the isolated-profile wrapper: [README-fork.md](
 
 - An A2A answer depends on the receiving model following the envelope; the plain-text relay covers only the receiving terminal's main agent, not its subagents.
 - A2A is machine-local (loopback). There is no cross-terminal team membership.
-- No team control protocol: no shutdown approval, plan approval or idle notifications.
-- `TASKS.md` claims are a convention; two members can edit the same row.
+- The task ledger lock covers one omp process; other processes must not share a team workspace concurrently.
+- The Teams live eval is a single small scenario (one member, one function); prompt changes beyond it are not measured.
 - An A2A pending spawn past the 30 s grace is reported as failed; poll `GetTask` by task id.
 - Workflow cannot interrupt async continuations after the first `await`.
 

@@ -66,20 +66,33 @@ Extensions can spawn subagents (`pi.spawnSubagent({agent, prompt})`) with ordina
 
 ### 9. Agent Teams
 
-Implemented. `.omp/teams/<name>.md` declares members, handles and an optional
-workspace. `/team start` spawns teammates **in-session** through the shared
-subagent seam (not separate terminals or A2A peers), with normalized registry
-ids and direct `agent://` messaging over IRC. Team spawns grant the full
-`write` tool even to read-only members; it is not limited to messaging.
-With a workspace, start creates `TASKS.md` if absent without overwriting it;
-`owner: <handle>` claims are a convention, not atomic locks. `/team list`,
-`/team status` and `/team stop` manage the team; stop releases only recorded
-member refs. Gated by `team.enabled`, capped by `team.maxTeammates`. No
-file-backed mailbox, split-pane, idle notification, shutdown approve flow or
-cross-terminal team membership. A member's own definition prompt outranks the
-team context: the bundled read-only `scout` and the structured-output
-`reviewer` ignore the team protocol in live runs; use definitions that may
-write and message peers (e.g. `task`).
+Implemented. `.omp/teams/<name>.md` (project) or `~/.omp/agent/teams/<name>.md`
+(user) declares members, handles, optional `model` / `thinking-level` per
+member, an optional workspace and seed `tasks`. `/team start` spawns teammates
+**in-session** as kept-alive subagents through the shared subagent seam (not
+separate terminals or A2A peers), with normalized registry ids and direct
+`agent://` messaging over IRC.
+
+- **Protocol:** `team://<team>` - overview and `/tasks` reads; atomic task
+  claim / release / done; plan submission (`/plan`) and the lead's decision
+  (`/plan/<member>`, also `/team approve|reject`); stop answers
+  (`/stop/<id>`). Every call is authenticated against the caller's trusted
+  session and team generation. The ledger is `tasks.json` in the workspace
+  (`TASKS.md` is a generated view) or in memory without one; its lock covers
+  one omp process.
+- **Notices:** plan submissions and decisions, "team finished" and the idle
+  notice that leaves the team quiet wake an idle lead or member; `wait` blocks
+  only on the caller's own jobs and on replies it asked for, and only the
+  lead's decision answers a submitted plan. The lead's hidden start note
+  carries the roster, the ledger as it stands and this wait rule.
+- **Delivery:** `agent://` receipts are `injected`, `woken`, `revived`,
+  `queued` (kept in the mailbox, retry refused as a duplicate) or `failed`.
+- **Permissions:** read-only definitions join only with a team prompt (bundled
+  `scout` and `reviewer` ship one) and get coordination-only write to
+  `agent://` and `team://`; full-write definitions keep full write.
+
+Gated by `team.enabled`, capped by `team.maxTeammates`. No split-pane or
+cross-terminal team membership.
 See [docs/agent-teams.md](./docs/agent-teams.md).
 
 ## Settings summary
@@ -102,7 +115,7 @@ Build from source, isolated profile and upstream sync: [README-fork.md](./README
 
 ## Verification
 
-Live scenarios (two real terminals, a team run, workflow resume after kill, refuse policy, token budget, handback, `pi.spawnSubagent`, chrome-mcp) with their observed results: [README.md → Verified live](./README.md#verified-live).
+Live scenarios (two real terminals, a team run, workflow resume after kill, refuse policy, token budget, handback, `pi.spawnSubagent`, chrome-mcp) and the 2026-11-16 scripted evals (`bun run eval:a2a`, `bun run eval:team-coordination`) with their observed results: [README.md → Verified live](./README.md#verified-live). Offline coordination suites: `bun run test:coordination`.
 
 ## Origins of the mechanics
 
