@@ -26,7 +26,7 @@ interface Frame {
 	success?: boolean;
 	status?: string;
 	error?: { message?: string };
-	message?: { role?: string; timestamp?: number };
+	message?: { role?: string; timestamp?: number; content?: Array<{ type?: string; text?: string }> };
 }
 
 /** How long the lead gets, once the change landed, to wake on the member's notice and report. */
@@ -144,18 +144,24 @@ async function main(): Promise<number> {
 			return 2;
 		}
 		// Landing is the member's half. The lead's half is waking on the member's
-		// final notice and reporting: its last reply must postdate the edit.
+		// final notice and answering the user: its last reply must postdate the
+		// edit and name `sub` (a wake turn that only says "still waiting" fails).
 		const appFile = path.join(project, "src", "app.ts");
-		const lastLeadReplyAt = () =>
-			frames.findLast(frame => frame.type === "message_end" && frame.message?.role === "assistant")?.message
-				?.timestamp ?? 0;
+		const leadReportedAfter = (editedAt: number) => {
+			const last = frames.findLast(
+				frame => frame.type === "message_end" && frame.message?.role === "assistant",
+			)?.message;
+			if (!last || (last.timestamp ?? 0) < editedAt) return false;
+			const text = (last.content ?? []).map(part => (part.type === "text" ? (part.text ?? "") : "")).join("");
+			return /\bsub\b/.test(text);
+		};
 		let reportDeadline = deadline;
 		while (Date.now() < Math.min(deadline, reportDeadline)) {
 			landed = (await Bun.file(appFile).text()).includes("function sub");
 			const state = await request({ type: "get_state" });
 			if (landed) {
 				reportDeadline = Math.min(reportDeadline, Date.now() + REPORT_GRACE_MS);
-				reported = state?.data?.isSettled === true && lastLeadReplyAt() >= (await fs.stat(appFile)).mtimeMs;
+				reported = state?.data?.isSettled === true && leadReportedAfter((await fs.stat(appFile)).mtimeMs);
 				if (reported) break;
 			}
 			await Bun.sleep(3000);
